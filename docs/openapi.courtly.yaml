@@ -1,0 +1,938 @@
+openapi: 3.1.0
+info:
+  title: Courtly API
+  version: 1.0.0
+  description: >
+    Full-scope API for Courtly tennis court booking platform.
+    Includes auth, courts, day/week availability, hold-based booking,
+    user cabinet, moderator/admin dashboard, dynamic RBAC/policy management,
+    and event log operations.
+servers:
+  - url: https://api.courtly.local
+    description: Production
+  - url: http://localhost:8000
+    description: Local development
+tags:
+  - name: Auth
+  - name: Courts
+  - name: Availability
+  - name: Bookings
+  - name: Cabinet
+  - name: Dashboard
+  - name: RBAC
+  - name: EventLog
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/health:
+    get:
+      tags: [Auth]
+      summary: Health check
+      security: []
+      responses:
+        "200":
+          description: API is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Login and issue tokens
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Token pair
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "401":
+          description: Invalid credentials
+
+  /api/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Refresh access token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "200":
+          description: New access token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccessTokenResponse"
+        "401":
+          description: Invalid refresh token
+
+  /api/auth/forgot-password:
+    post:
+      tags: [Auth]
+      summary: Request password reset email
+      security: []
+      description: >
+        Sends password reset link if account exists.
+        Always returns generic accepted response to prevent user enumeration.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForgotPasswordRequest"
+      responses:
+        "202":
+          description: Accepted (generic response)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "If an account exists, password reset instructions were sent."
+
+  /api/auth/reset-password:
+    post:
+      tags: [Auth]
+      summary: Confirm password reset using one-time token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResetPasswordRequest"
+      responses:
+        "204":
+          description: Password reset successfully
+        "400":
+          description: Invalid or expired token
+
+  /api/auth/change-password:
+    post:
+      tags: [Auth]
+      summary: Change current password
+      responses:
+        "204":
+          description: Password changed
+        "400":
+          description: Invalid input
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChangePasswordRequest"
+
+  /api/courts:
+    get:
+      tags: [Courts]
+      summary: List courts with filters
+      security: []
+      parameters:
+        - in: query
+          name: city
+          schema: { type: string }
+        - in: query
+          name: district
+          schema: { type: string }
+        - in: query
+          name: lat
+          schema: { type: number, format: float }
+        - in: query
+          name: lng
+          schema: { type: number, format: float }
+        - in: query
+          name: radius_km
+          schema: { type: number, format: float, default: 10 }
+      responses:
+        "200":
+          description: Court list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CourtSummary"
+    post:
+      tags: [Courts]
+      summary: Create court
+      x-rbac:
+        permission: courts:create
+        ownership: none
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CourtCreateRequest"
+      responses:
+        "201":
+          description: Court created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CourtDetail"
+        "403":
+          description: Forbidden
+
+  /api/courts/{court_id}:
+    get:
+      tags: [Courts]
+      summary: Get court detail
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/CourtId"
+      responses:
+        "200":
+          description: Court detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CourtDetail"
+        "404":
+          description: Court not found
+    patch:
+      tags: [Courts]
+      summary: Update court
+      x-rbac:
+        permission: courts:update
+        ownership: own_court_or_admin
+      parameters:
+        - $ref: "#/components/parameters/CourtId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CourtUpdateRequest"
+      responses:
+        "200":
+          description: Court updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CourtDetail"
+        "403":
+          description: Forbidden
+    delete:
+      tags: [Courts]
+      summary: Delete court
+      x-rbac:
+        permission: courts:delete
+        ownership: own_court_or_admin
+      parameters:
+        - $ref: "#/components/parameters/CourtId"
+      responses:
+        "204":
+          description: Court deleted
+        "403":
+          description: Forbidden
+
+  /api/courts/{court_id}/availability:
+    get:
+      tags: [Availability]
+      summary: Get court availability in day or week mode
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/CourtId"
+        - in: query
+          name: mode
+          required: true
+          schema:
+            type: string
+            enum: [day, week]
+        - in: query
+          name: date
+          required: true
+          schema:
+            type: string
+            format: date
+      responses:
+        "200":
+          description: Availability data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AvailabilityResponse"
+
+  /api/bookings/hold:
+    post:
+      tags: [Bookings]
+      summary: Hold slots temporarily
+      x-rbac:
+        permission: bookings:hold
+        ownership: principal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BookingHoldRequest"
+      responses:
+        "201":
+          description: Hold created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingHoldResponse"
+        "409":
+          description: Slot conflict
+        "422":
+          description: Invalid slot selection
+
+  /api/bookings/confirm:
+    post:
+      tags: [Bookings]
+      summary: Confirm booking from hold token
+      x-rbac:
+        permission: bookings:confirm
+        ownership: principal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BookingConfirmRequest"
+      responses:
+        "201":
+          description: Booking confirmed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingResponse"
+        "409":
+          description: Hold expired or conflicted
+
+  /api/bookings/{booking_id}/cancel:
+    post:
+      tags: [Bookings]
+      summary: Cancel booking
+      x-rbac:
+        permission: bookings:cancel
+        ownership: own_booking_or_admin
+      parameters:
+        - $ref: "#/components/parameters/BookingId"
+      responses:
+        "200":
+          description: Booking cancelled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingResponse"
+        "403":
+          description: Forbidden
+
+  /api/me/bookings:
+    get:
+      tags: [Cabinet]
+      summary: List current user bookings
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [active, past, cancelled, all]
+      responses:
+        "200":
+          description: User bookings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/BookingResponse"
+
+  /api/me/profile:
+    get:
+      tags: [Cabinet]
+      summary: Get own profile
+      responses:
+        "200":
+          description: Own profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProfileSelf"
+    patch:
+      tags: [Cabinet]
+      summary: Update own profile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProfileUpdateRequest"
+      responses:
+        "200":
+          description: Updated profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProfileSelf"
+
+  /api/me/favorites:
+    get:
+      tags: [Cabinet]
+      summary: List own favorite courts
+      responses:
+        "200":
+          description: Favorite courts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CourtSummary"
+    post:
+      tags: [Cabinet]
+      summary: Add favorite court
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [court_id]
+              properties:
+                court_id:
+                  type: string
+                  format: uuid
+      responses:
+        "204":
+          description: Added
+
+  /api/me/reviews:
+    post:
+      tags: [Cabinet]
+      summary: Create review
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReviewCreateRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewResponse"
+
+  /api/dashboard/courts/{court_id}/transfer-ownership:
+    post:
+      tags: [Dashboard]
+      summary: Transfer court ownership by email (anti-enumeration)
+      x-rbac:
+        permission: courts:transfer_ownership
+        ownership: own_court_or_admin
+      parameters:
+        - $ref: "#/components/parameters/CourtId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_email]
+              properties:
+                target_email:
+                  type: string
+                  format: email
+      responses:
+        "202":
+          description: Accepted (generic response regardless of account existence)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "If eligible, transfer instructions will be processed."
+
+  /api/dashboard/notifications/email:
+    post:
+      tags: [Dashboard]
+      summary: Send notification email
+      x-rbac:
+        permission: notifications:send_email
+        ownership: policy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmailNotificationRequest"
+      responses:
+        "202":
+          description: Accepted for processing
+
+  /api/admin/users:
+    get:
+      tags: [Dashboard]
+      summary: List users (non-PII projection only)
+      x-rbac:
+        permission: users:list
+        ownership: admin_any
+      responses:
+        "200":
+          description: Users projection
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/UserProjection"
+
+  /api/admin/roles:
+    get:
+      tags: [RBAC]
+      summary: List roles
+      x-rbac:
+        permission: roles:read
+        ownership: admin_any
+      responses:
+        "200":
+          description: Roles
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/RoleResponse"
+    post:
+      tags: [RBAC]
+      summary: Create role
+      x-rbac:
+        permission: roles:create
+        ownership: admin_any
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoleCreateRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoleResponse"
+
+  /api/admin/policies:
+    post:
+      tags: [RBAC]
+      summary: Create policy rule
+      x-rbac:
+        permission: policies:create
+        ownership: admin_any
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PolicyCreateRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyResponse"
+
+  /api/admin/event-log/replay:
+    post:
+      tags: [EventLog]
+      summary: Replay event log into database
+      x-rbac:
+        permission: event_log:replay
+        ownership: admin_any
+      responses:
+        "202":
+          description: Replay started
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    CourtId:
+      in: path
+      name: court_id
+      required: true
+      schema:
+        type: string
+        format: uuid
+    BookingId:
+      in: path
+      name: booking_id
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+
+    ChangePasswordRequest:
+      type: object
+      required: [old_password, new_password]
+      properties:
+        old_password:
+          type: string
+        new_password:
+          type: string
+          minLength: 8
+
+    ForgotPasswordRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+
+    ResetPasswordRequest:
+      type: object
+      required: [reset_token, new_password]
+      properties:
+        reset_token:
+          type: string
+          description: One-time password reset token from email link.
+        new_password:
+          type: string
+          minLength: 8
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        token_type:
+          type: string
+          example: bearer
+
+    AccessTokenResponse:
+      type: object
+      required: [access_token, token_type]
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          example: bearer
+
+    CourtCreateRequest:
+      type: object
+      required: [name, city, district, address, timezone]
+      properties:
+        name: { type: string }
+        city: { type: string }
+        district: { type: string }
+        address: { type: string }
+        timezone: { type: string, example: Europe/Kyiv }
+        lat: { type: number, format: float }
+        lng: { type: number, format: float }
+        indoor: { type: boolean, default: false }
+        surface: { type: string, example: hard }
+        price_per_hour: { type: number, format: float, minimum: 0 }
+        working_hours:
+          type: array
+          items:
+            $ref: "#/components/schemas/WorkingHours"
+
+    CourtUpdateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        city: { type: string }
+        district: { type: string }
+        address: { type: string }
+        indoor: { type: boolean }
+        surface: { type: string }
+        price_per_hour: { type: number, format: float, minimum: 0 }
+
+    CourtSummary:
+      type: object
+      required: [id, name, city, district, next_available_slot]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        city: { type: string }
+        district: { type: string }
+        address: { type: string }
+        rating: { type: number, format: float }
+        distance_km: { type: number, format: float }
+        price_from: { type: number, format: float }
+        next_available_slot: { type: string, format: date-time }
+
+    CourtDetail:
+      allOf:
+        - $ref: "#/components/schemas/CourtSummary"
+        - type: object
+          properties:
+            description: { type: string }
+            indoor: { type: boolean }
+            surface: { type: string }
+            media_urls:
+              type: array
+              items: { type: string, format: uri }
+            working_hours:
+              type: array
+              items:
+                $ref: "#/components/schemas/WorkingHours"
+
+    WorkingHours:
+      type: object
+      required: [weekday, open_time, close_time]
+      properties:
+        weekday:
+          type: integer
+          minimum: 0
+          maximum: 6
+        open_time:
+          type: string
+          pattern: "^[0-2][0-9]:[0-5][0-9]$"
+        close_time:
+          type: string
+          pattern: "^[0-2][0-9]:[0-5][0-9]$"
+
+    AvailabilitySlot:
+      type: object
+      required: [start_at, end_at, state]
+      properties:
+        start_at: { type: string, format: date-time }
+        end_at: { type: string, format: date-time }
+        state:
+          type: string
+          enum: [free, held, booked, disabled, past]
+        held_until:
+          type: string
+          format: date-time
+          nullable: true
+
+    AvailabilityDay:
+      type: object
+      required: [date, slots]
+      properties:
+        date: { type: string, format: date }
+        slots:
+          type: array
+          items:
+            $ref: "#/components/schemas/AvailabilitySlot"
+
+    AvailabilityResponse:
+      type: object
+      required: [mode, days]
+      properties:
+        mode:
+          type: string
+          enum: [day, week]
+        days:
+          type: array
+          items:
+            $ref: "#/components/schemas/AvailabilityDay"
+
+    BookingHoldRequest:
+      type: object
+      required: [court_id, slot_starts]
+      properties:
+        court_id:
+          type: string
+          format: uuid
+        slot_starts:
+          type: array
+          minItems: 2
+          items:
+            type: string
+            format: date-time
+      description: "slot_starts must represent contiguous 30-minute slots, minimum total 60 minutes."
+
+    BookingHoldResponse:
+      type: object
+      required: [hold_token, held_until, court_id, slot_starts]
+      properties:
+        hold_token: { type: string }
+        held_until: { type: string, format: date-time }
+        court_id: { type: string, format: uuid }
+        slot_starts:
+          type: array
+          items: { type: string, format: date-time }
+
+    BookingConfirmRequest:
+      type: object
+      required: [hold_token]
+      properties:
+        hold_token: { type: string }
+
+    BookingResponse:
+      type: object
+      required: [id, court_id, user_id, status, start_at, end_at, total_price]
+      properties:
+        id: { type: string, format: uuid }
+        court_id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [confirmed, active, completed, cancelled]
+        start_at: { type: string, format: date-time }
+        end_at: { type: string, format: date-time }
+        total_price: { type: number, format: float }
+        created_at: { type: string, format: date-time }
+
+    ProfileSelf:
+      type: object
+      required: [user_id, full_name, email, phone, role]
+      properties:
+        user_id: { type: string, format: uuid }
+        full_name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string }
+        role: { type: string }
+        created_at: { type: string, format: date-time }
+
+    ProfileUpdateRequest:
+      type: object
+      properties:
+        full_name: { type: string }
+        phone: { type: string }
+
+    ReviewCreateRequest:
+      type: object
+      required: [court_id, rating, text]
+      properties:
+        court_id: { type: string, format: uuid }
+        rating: { type: integer, minimum: 1, maximum: 5 }
+        text: { type: string, minLength: 3, maxLength: 1000 }
+
+    ReviewResponse:
+      type: object
+      required: [id, court_id, rating, text, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        court_id: { type: string, format: uuid }
+        rating: { type: integer }
+        text: { type: string }
+        created_at: { type: string, format: date-time }
+
+    UserProjection:
+      type: object
+      required: [user_id, role, account_status, created_at]
+      properties:
+        user_id: { type: string, format: uuid }
+        role: { type: string }
+        account_status: { type: string, enum: [active, blocked, deleted] }
+        created_at: { type: string, format: date-time }
+        booking_stats:
+          type: object
+          properties:
+            total_bookings: { type: integer }
+            active_bookings: { type: integer }
+            cancelled_bookings: { type: integer }
+
+    RoleCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        description: { type: string }
+
+    RoleResponse:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string }
+
+    PolicyCreateRequest:
+      type: object
+      required: [name, effect, condition]
+      properties:
+        name: { type: string }
+        effect:
+          type: string
+          enum: [allow, deny]
+        condition:
+          type: string
+          description: "Policy expression evaluated by policy engine."
+
+    PolicyResponse:
+      type: object
+      required: [id, name, effect, condition]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        effect: { type: string, enum: [allow, deny] }
+        condition: { type: string }
+
+    EmailNotificationRequest:
+      type: object
+      required: [subject, body, recipient_scope]
+      properties:
+        subject: { type: string, minLength: 3, maxLength: 120 }
+        body: { type: string, minLength: 3, maxLength: 5000 }
+        recipient_scope:
+          type: string
+          enum: [all_users, active_users, custom_segment]

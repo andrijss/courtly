@@ -1,0 +1,307 @@
+version: "1.0"
+service: "courtly-api"
+notes:
+  - "pii_visibility: moderator/admin/superuser cannot access plaintext PII."
+  - "ownership transfer APIs must return generic responses to prevent user enumeration."
+
+roles:
+  guest:
+    description: "Unauthenticated visitor"
+  user:
+    description: "Authenticated end-user"
+  moderator:
+    description: "Court owner/operator with scoped resource control"
+  admin:
+    description: "Platform admin with global management rights"
+  superuser:
+    description: "Bootstrap authority for admin lifecycle"
+
+ownership_rules:
+  own_booking: "booking.user_id == principal.id"
+  own_court: "court.owner_id == principal.id"
+  admin_any: "principal.role in [admin, superuser]"
+  pii_self_only: "principal.id == target_user.id"
+  pii_blocked_for_ops_roles: "principal.role in [moderator, admin, superuser] => deny_pii_projection"
+
+resources:
+  auth_password_recovery:
+    actions:
+      request_reset_email:
+        guest: allow
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+        response_policy: "always_202_generic"
+      reset_with_token:
+        guest: allow
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+
+  courts:
+    actions:
+      list:
+        guest: allow
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+      read:
+        guest: allow
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+      create:
+        guest: deny
+        user: deny
+        moderator: allow
+        admin: allow
+        superuser: allow
+      update:
+        guest: deny
+        user: deny
+        moderator:
+          effect: allow
+          ownership: own_court
+        admin: allow
+        superuser: allow
+      delete:
+        guest: deny
+        user: deny
+        moderator:
+          effect: allow
+          ownership: own_court
+        admin: allow
+        superuser: allow
+
+  availability:
+    actions:
+      read_week:
+        guest: allow
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+      read_day:
+        guest: allow
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+
+  bookings:
+    actions:
+      hold_slots:
+        guest: deny
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+      confirm:
+        guest: deny
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+      cancel:
+        guest: deny
+        user:
+          effect: allow
+          ownership: own_booking
+        moderator:
+          effect: allow
+          ownership: own_booking
+        admin: allow
+        superuser: allow
+      list_my:
+        guest: deny
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+      list_all:
+        guest: deny
+        user: deny
+        moderator: deny
+        admin: allow
+        superuser: allow
+
+  favorites:
+    actions:
+      list_my:
+        guest: deny
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+      add:
+        guest: deny
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+      remove:
+        guest: deny
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+
+  reviews:
+    actions:
+      list_public:
+        guest: allow
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+      create:
+        guest: deny
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+      update:
+        guest: deny
+        user:
+          effect: allow
+          ownership: "review.user_id == principal.id"
+        moderator: deny
+        admin: allow
+        superuser: allow
+      delete:
+        guest: deny
+        user:
+          effect: allow
+          ownership: "review.user_id == principal.id"
+        moderator: deny
+        admin: allow
+        superuser: allow
+
+  profile:
+    actions:
+      read_self:
+        guest: deny
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+      update_self:
+        guest: deny
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+      request_data_deletion:
+        guest: deny
+        user: allow
+        moderator: allow
+        admin: allow
+        superuser: allow
+
+  users:
+    actions:
+      list_non_pii:
+        guest: deny
+        user: deny
+        moderator: deny
+        admin: allow
+        superuser: allow
+      create:
+        guest: deny
+        user: deny
+        moderator: deny
+        admin: allow
+        superuser: allow
+      update:
+        guest: deny
+        user: deny
+        moderator: deny
+        admin: allow
+        superuser: allow
+      delete:
+        guest: deny
+        user: deny
+        moderator: deny
+        admin: allow
+        superuser: allow
+
+  rbac_policies:
+    actions:
+      roles_crud:
+        guest: deny
+        user: deny
+        moderator: deny
+        admin: allow
+        superuser: allow
+      permissions_crud:
+        guest: deny
+        user: deny
+        moderator: deny
+        admin: allow
+        superuser: allow
+      policies_crud:
+        guest: deny
+        user: deny
+        moderator: deny
+        admin: allow
+        superuser: allow
+      bindings_crud:
+        guest: deny
+        user: deny
+        moderator: deny
+        admin: allow
+        superuser: allow
+
+  ownership_transfer:
+    actions:
+      initiate_by_email:
+        guest: deny
+        user: deny
+        moderator:
+          effect: allow
+          ownership: own_court
+        admin: allow
+        superuser: allow
+        response_policy: "always_202_generic"
+
+  notifications:
+    actions:
+      send_email:
+        guest: deny
+        user: deny
+        moderator: allow
+        admin: allow
+        superuser: allow
+
+  event_log:
+    actions:
+      append_write_events:
+        guest: deny
+        user: system
+        moderator: system
+        admin: system
+        superuser: system
+      replay:
+        guest: deny
+        user: deny
+        moderator: deny
+        admin: allow
+        superuser: allow
+
+pii_projection_policy:
+  returned_fields_non_pii:
+    - user_id
+    - role
+    - account_status
+    - created_at
+    - booking_stats
+  denied_fields:
+    - full_name
+    - email
+    - phone
+  exception:
+    self_access_only: true
