@@ -15,9 +15,21 @@ from app.event_snapshots import (
     role_permission_dict,
     user_dict,
 )
-from app.models import Booking, Permission, Policy, Role, RoleBinding, RolePermission, User
+from app.gdpr import approve_request, cancel_request, serialize, sweep_expired
+from app.models import (
+    Booking,
+    DataDeletionRequest,
+    Permission,
+    Policy,
+    Role,
+    RoleBinding,
+    RolePermission,
+    User,
+)
 from app.replay import replay_events
 from app.schemas import (
+    DataDeletionAdminAction,
+    DataDeletionRequestResponse,
     EventReplayResponse,
     Message,
     PermissionCreateRequest,
@@ -41,6 +53,25 @@ encryptor = PIIEncryptor()
 def _admin_only(user: User) -> None:
     if user.role not in {"admin", "superuser"}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient role")
+
+
+def _protect_critical_user(actor: User, target: User, action: str) -> None:
+    """Guards against self-deletion and against removing/demoting a superuser."""
+    if action in {"delete", "demote"} and target.id == actor.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You cannot perform this action on your own account.",
+        )
+    if action == "delete" and target.role == "superuser":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Superuser account is system-critical and cannot be deleted.",
+        )
+    if action == "demote" and target.role == "superuser":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Superuser role cannot be changed.",
+        )
 
 
 @router.get("/users", response_model=list[UserProjection])
@@ -83,6 +114,10 @@ def update_user(
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     changes = payload.model_dump(exclude_unset=True)
+    if "role" in changes and changes["role"] != model.role:
+        _protect_critical_user(user, model, "demote")
+    if "is_active" in changes and changes["is_active"] is False:
+        _protect_critical_user(user, model, "delete")
     if "phone" in changes:
         model.phone_encrypted = encryptor.encrypt(changes.pop("phone")) if changes["phone"] else None
     for key, value in changes.items():
@@ -100,6 +135,7 @@ def delete_user(user_id: int, user: User = Depends(get_current_user), db: Sessio
     model = db.get(User, user_id)
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    _protect_critical_user(user, model, "delete")
     db.delete(model)
     db.commit()
     event_logger.append("admin.user_deleted", user.id, {"target_user_id": user_id})
@@ -305,3 +341,54 @@ def replay_event_log(user: User = Depends(get_current_user), db: Session = Depen
     count = replay_events(event_logger.path, db)
     event_logger.append("event_log.replayed", user.id, {"events_replayed": count})
     return EventReplayResponse(ok=True, events_replayed=count)
+
+
+@router.get("/data-deletion-requests", response_model=list[DataDeletionRequestResponse])
+def list_data_deletion_requests(
+    status_filter: str = "pending",
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    _admin_only(user)
+    enforce_policy(db, user, "/admin/data-deletion-requests", "read")
+    sweep_expired(db)
+    query = select(DataDeletionRequest).order_by(DataDeletionRequest.requested_at.desc())
+    if status_filter and status_filter != "all":
+        query = query.where(DataDeletionRequest.status == status_filter)
+    return [serialize(row) for row in db.scalars(query)]
+
+
+@router.post("/data-deletion-requests/{request_id}/approve", response_model=DataDeletionRequestResponse)
+def approve_data_deletion_request(
+    request_id: int,
+    payload: DataDeletionAdminAction | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _admin_only(user)
+    enforce_policy(db, user, "/admin/data-deletion-requests/:requestId", "update")
+    request = db.get(DataDeletionRequest, request_id)
+    if request is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found")
+    if request.status != "pending":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Request already processed")
+    approve_request(db, request, actor_id=user.id, note=payload.note if payload else None)
+    return serialize(request)
+
+
+@router.post("/data-deletion-requests/{request_id}/reject", response_model=DataDeletionRequestResponse)
+def reject_data_deletion_request(
+    request_id: int,
+    payload: DataDeletionAdminAction | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _admin_only(user)
+    enforce_policy(db, user, "/admin/data-deletion-requests/:requestId", "update")
+    request = db.get(DataDeletionRequest, request_id)
+    if request is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found")
+    if request.status != "pending":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Request already processed")
+    cancel_request(db, request, actor_id=user.id, note=payload.note if payload else None)
+    return serialize(request)

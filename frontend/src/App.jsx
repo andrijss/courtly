@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
 import { MapContainer, Marker, Popup, TileLayer, useMap } from "react-leaflet";
 import logoUrl from "../logo.svg";
-import { API_ORIGIN, api, setAccessToken } from "./api";
+import { API_ORIGIN, api, isTokenExpired, onUnauthorized, setAccessToken } from "./api";
 
 const courtVisuals = [
   "linear-gradient(135deg, rgba(199,226,29,.95), rgba(245,245,243,.7)), radial-gradient(circle at 20% 20%, #111 0 2px, transparent 3px)",
@@ -51,7 +51,9 @@ const endpointPermissionCatalog = [
   { endpoint: "/admin/policies/:policyId", methods: ["update", "delete"] },
   { endpoint: "/admin/bookings", methods: ["read"] },
   { endpoint: "/admin/event-log/replay", methods: ["create"] },
-  { endpoint: "/dashboard/notifications/email", methods: ["create"] }
+  { endpoint: "/dashboard/notifications/email", methods: ["create"] },
+  { endpoint: "/dashboard/bookings", methods: ["read"] },
+  { endpoint: "/dashboard/bookings/:bookingId/remind", methods: ["create"] }
 ];
 
 function formatMoney(value) {
@@ -91,6 +93,149 @@ function displayTime(value) {
 
 function displayDate(value) {
   return new Date(value).toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function displayLongDate(value) {
+  return new Date(value).toLocaleDateString("uk-UA", { day: "numeric", month: "long", year: "numeric" });
+}
+
+function formatBookingRange(startsAt, endsAt) {
+  return `${displayLongDate(startsAt)} · ${displayTime(startsAt)} – ${displayTime(endsAt)}`;
+}
+
+function bookingDurationMinutes(startsAt, endsAt) {
+  const diff = new Date(endsAt).getTime() - new Date(startsAt).getTime();
+  return Math.max(0, Math.round(diff / 60000));
+}
+
+function passwordPolicyStatus(value) {
+  return {
+    minLength: value.length >= 8,
+    hasUpper: /[A-Z]/.test(value),
+    hasLower: /[a-z]/.test(value),
+    hasDigit: /\d/.test(value),
+    hasSpecial: /[^A-Za-z0-9]/.test(value)
+  };
+}
+
+function estimatePasswordEntropy(value) {
+  if (!value) {
+    return 0;
+  }
+  let pool = 0;
+  if (/[a-z]/.test(value)) {
+    pool += 26;
+  }
+  if (/[A-Z]/.test(value)) {
+    pool += 26;
+  }
+  if (/\d/.test(value)) {
+    pool += 10;
+  }
+  if (/[^A-Za-z0-9]/.test(value)) {
+    pool += 32;
+  }
+  if (pool === 0) {
+    return 0;
+  }
+  return Math.log2(pool) * value.length;
+}
+
+function getPasswordStrength(value) {
+  const policy = passwordPolicyStatus(value);
+  const isCompliant = Object.values(policy).every(Boolean);
+  if (!isCompliant) {
+    return "low";
+  }
+  const entropy = estimatePasswordEntropy(value);
+  if (value.length < 12 || entropy < 60) {
+    return "mid";
+  }
+  return "secure";
+}
+
+function bookingStatusInfo(booking) {
+  if (!booking) {
+    return { label: "—", tone: "neutral", group: "past" };
+  }
+  const status = booking.status;
+  const startsAt = new Date(booking.starts_at).getTime();
+  const isFuture = startsAt > Date.now();
+  if (status === "cancelled") {
+    return { label: "Скасовано", tone: "danger", group: "cancelled" };
+  }
+  if (status === "completed") {
+    return { label: "Завершено", tone: "muted", group: "past" };
+  }
+  if (status === "draft_hold") {
+    return { label: "Тримається", tone: "warning", group: isFuture ? "upcoming" : "past" };
+  }
+  if (status === "confirmed" || status === "active") {
+    return {
+      label: isFuture ? "Підтверджено" : "Завершено",
+      tone: isFuture ? "success" : "muted",
+      group: isFuture ? "upcoming" : "past"
+    };
+  }
+  return { label: status || "—", tone: "neutral", group: isFuture ? "upcoming" : "past" };
+}
+
+function isBookingCancellable(booking) {
+  if (!booking) {
+    return false;
+  }
+  if (booking.status === "cancelled" || booking.status === "completed") {
+    return false;
+  }
+  return new Date(booking.starts_at).getTime() > Date.now();
+}
+
+function getInitials(fullName) {
+  if (!fullName) {
+    return "?";
+  }
+  const parts = fullName.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) {
+    return "?";
+  }
+  const letters = parts.slice(0, 2).map((part) => part[0].toUpperCase());
+  return letters.join("");
+}
+
+function secondsUntil(deadlineIso, nowMs) {
+  if (!deadlineIso) {
+    return 0;
+  }
+  const deadlineMs = new Date(deadlineIso).getTime();
+  return Math.floor((deadlineMs - nowMs) / 1000);
+}
+
+function formatCountdown(seconds) {
+  const safe = Math.max(0, Math.floor(seconds));
+  const days = Math.floor(safe / 86400);
+  const hours = Math.floor((safe % 86400) / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  if (days > 0) {
+    return `${days} дн. ${hours} год.`;
+  }
+  if (hours > 0) {
+    return `${hours} год. ${minutes} хв.`;
+  }
+  return `${minutes} хв.`;
+}
+
+function deletionUrgencyTone(seconds) {
+  if (seconds <= 0) {
+    return "danger";
+  }
+  const days = seconds / 86400;
+  if (days <= 3) {
+    return "danger";
+  }
+  if (days <= 7) {
+    return "warning";
+  }
+  return "success";
 }
 
 function sameSlot(a, b) {
@@ -248,14 +393,27 @@ function CourtsMap({ activeCourt, courts, onSelectCourt }) {
 
 export default function App() {
   const filterChipOptions = ["Поруч зі мною", "Indoor", "Open now", "4.5+ rating"];
-  const [email, setEmail] = useState("superuser@courtly.example.com");
-  const [password, setPassword] = useState("ChangeMeNow123!");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [mfaCode, setMfaCode] = useState("");
+  const [mfaChallengeToken, setMfaChallengeToken] = useState("");
+  const [mfaDevCode, setMfaDevCode] = useState("");
+  const [emailVerificationCode, setEmailVerificationCode] = useState("");
+  const [emailVerificationChallengeToken, setEmailVerificationChallengeToken] = useState("");
+  const [emailVerificationDevCode, setEmailVerificationDevCode] = useState("");
   const [authMode, setAuthMode] = useState("signin");
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [acceptedTerms, setAcceptedTerms] = useState(false);
-  const [token, setToken] = useState(() => localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || "");
+  const [token, setToken] = useState(() => {
+    const stored = localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || "";
+    if (stored && isTokenExpired(stored)) {
+      localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+      return "";
+    }
+    return stored;
+  });
   const [view, setView] = useState("home");
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [isProfileMenuOpen, setIsProfileMenuOpen] = useState(false);
@@ -272,11 +430,13 @@ export default function App() {
   const [bookings, setBookings] = useState([]);
   const [myReviews, setMyReviews] = useState([]);
   const [cabinetTab, setCabinetTab] = useState("bookings");
+  const [bookingStatusFilter, setBookingStatusFilter] = useState("upcoming");
   const [selectedBooking, setSelectedBooking] = useState(null);
   const [reviewRating, setReviewRating] = useState(5);
   const [reviewComment, setReviewComment] = useState("");
   const [moderatorMessage, setModeratorMessage] = useState("");
   const [profile, setProfile] = useState(null);
+  const [profileDraft, setProfileDraft] = useState(null);
   const [favorites, setFavorites] = useState([]);
   const [adminUsers, setAdminUsers] = useState([]);
   const [roles, setRoles] = useState([]);
@@ -285,6 +445,11 @@ export default function App() {
   const [expandedEndpoint, setExpandedEndpoint] = useState(endpointPermissionCatalog[0]?.endpoint || "");
   const [expandedMethodKey, setExpandedMethodKey] = useState("");
   const [adminBookings, setAdminBookings] = useState([]);
+  const [bookingRemindComments, setBookingRemindComments] = useState({});
+  const [dataDeletionRequests, setDataDeletionRequests] = useState([]);
+  const [dataDeletionFilter, setDataDeletionFilter] = useState("pending");
+  const [myDataDeletionRequest, setMyDataDeletionRequest] = useState(null);
+  const [nowTick, setNowTick] = useState(() => Date.now());
   const [selectedAdminUserId, setSelectedAdminUserId] = useState(null);
   const [adminUserForm, setAdminUserForm] = useState(null);
   const [selectedAdminCourtId, setSelectedAdminCourtId] = useState("");
@@ -316,6 +481,9 @@ export default function App() {
   const [confirmDialog, setConfirmDialog] = useState(null);
   const profileMenuRef = useRef(null);
   const confirmResolverRef = useRef(null);
+  const signupPasswordPolicy = useMemo(() => passwordPolicyStatus(password), [password]);
+  const isSignupPasswordCompliant = useMemo(() => Object.values(signupPasswordPolicy).every(Boolean), [signupPasswordPolicy]);
+  const signupPasswordStrength = useMemo(() => getPasswordStrength(password), [password]);
 
   const addLog = (title, payload) => {
     setLog((current) => [{ title, payload }, ...current].slice(0, 10));
@@ -405,6 +573,30 @@ export default function App() {
   const selectedTotal = Math.round((activeCourt?.price_per_hour || 0) * (selectedDuration / 60));
   const canConfirmSelection = isContiguous(selectedSlots);
   const slotHint = canConfirmSelection ? "Можна підтверджувати." : "Обери два або більше суміжні слоти.";
+  const bookingGroups = useMemo(() => {
+    const groups = { upcoming: [], past: [], cancelled: [] };
+    for (const booking of bookings) {
+      const info = bookingStatusInfo(booking);
+      if (groups[info.group]) {
+        groups[info.group].push(booking);
+      }
+    }
+    return groups;
+  }, [bookings]);
+  const visibleBookings = useMemo(() => {
+    if (bookingStatusFilter === "all") {
+      return bookings;
+    }
+    return bookingGroups[bookingStatusFilter] || [];
+  }, [bookings, bookingGroups, bookingStatusFilter]);
+  const totalSpent = useMemo(
+    () =>
+      bookings
+        .filter((booking) => booking.status !== "cancelled" && booking.status !== "draft_hold")
+        .reduce((sum, booking) => sum + (Number(booking.total_price) || 0), 0),
+    [bookings]
+  );
+  const isEditingProfile = profileDraft !== null;
 
   useEffect(() => {
     loadCourts();
@@ -414,13 +606,73 @@ export default function App() {
     if (!token) {
       setAccessToken("");
       localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+      setMyDataDeletionRequest(null);
       return;
     }
 
     setAccessToken(token);
     localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, token);
     loadCabinet(true);
+    loadMyDataDeletionStatus();
   }, [token]);
+
+  useEffect(() => {
+    const id = setInterval(() => setNowTick(Date.now()), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    if (!error) {
+      return undefined;
+    }
+    const id = setTimeout(() => setError(""), 6000);
+    return () => clearTimeout(id);
+  }, [error]);
+
+  useEffect(() => {
+    if (!success) {
+      return undefined;
+    }
+    const id = setTimeout(() => setSuccess(""), 4000);
+    return () => clearTimeout(id);
+  }, [success]);
+
+  useEffect(() => {
+    onUnauthorized((reason) => {
+      if (!localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY)) {
+        return;
+      }
+      localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+      setAccessToken("");
+      setToken("");
+      setProfile(null);
+      setProfileDraft(null);
+      setBookings([]);
+      setMyReviews([]);
+      setFavorites([]);
+      setSelectedBooking(null);
+      setMyDataDeletionRequest(null);
+      setAdminUsers([]);
+      setRoles([]);
+      setPolicies([]);
+      setAdminBookings([]);
+      setDataDeletionRequests([]);
+      setView("cabinet");
+      setSuccess("");
+      setError(
+        reason === "expired"
+          ? "Сесія завершилась — увійди заново."
+          : "Сесію відхилено сервером — увійди заново."
+      );
+    });
+    return () => onUnauthorized(null);
+  }, []);
+
+  useEffect(() => {
+    if (view === "admin" && isAuthed && isManager) {
+      loadDataDeletionRequests(dataDeletionFilter);
+    }
+  }, [dataDeletionFilter, view, isAuthed, isManager]);
 
   useEffect(() => {
     if (activeCourtId) {
@@ -433,6 +685,12 @@ export default function App() {
       loadAdmin();
     }
   }, [view, isAuthed, isManager]);
+
+  useEffect(() => {
+    if (profile?.role === "moderator" && adminTab !== "bookings") {
+      setAdminTab("bookings");
+    }
+  }, [profile, adminTab]);
 
   useEffect(() => {
     if (view === "detail" && activeCourtId) {
@@ -480,8 +738,68 @@ export default function App() {
     setSuccess("");
     try {
       const data = await api.login({ email, password });
+      if (data.email_verification_required) {
+        setEmailVerificationChallengeToken(data.email_verification_challenge_token || "");
+        setEmailVerificationDevCode(data.email_verification_dev_code || "");
+        setEmailVerificationCode("");
+        setMfaChallengeToken("");
+        setSuccess("Ми відправили код підтвердження на вашу пошту.");
+        return;
+      }
+      if (data.mfa_required) {
+        setMfaChallengeToken(data.mfa_challenge_token || "");
+        setMfaDevCode(data.mfa_dev_code || "");
+        setMfaCode("");
+        setEmailVerificationChallengeToken("");
+        setSuccess("На вашу пошту відправлено 6-значний код.");
+        return;
+      }
       setToken(data.access_token);
       addLog("Login", data);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function handleVerifyMfa(event) {
+    event.preventDefault();
+    setError("");
+    setSuccess("");
+    if (!mfaChallengeToken) {
+      setError("MFA challenge не знайдено. Спробуйте увійти ще раз.");
+      return;
+    }
+    try {
+      const data = await api.verify2fa({ challenge_token: mfaChallengeToken, code: mfaCode.trim() });
+      setToken(data.access_token);
+      setMfaChallengeToken("");
+      setMfaCode("");
+      setMfaDevCode("");
+      addLog("MFA verified", data);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function handleVerifyEmail(event) {
+    event.preventDefault();
+    setError("");
+    setSuccess("");
+    if (!emailVerificationChallengeToken) {
+      setError("Email verification challenge не знайдено. Спробуйте увійти або зареєструватись ще раз.");
+      return;
+    }
+    try {
+      const data = await api.verifyEmail({
+        challenge_token: emailVerificationChallengeToken,
+        code: emailVerificationCode.trim()
+      });
+      setToken(data.access_token);
+      setEmailVerificationChallengeToken("");
+      setEmailVerificationCode("");
+      setEmailVerificationDevCode("");
+      setSuccess("Email підтверджено.");
+      addLog("Email verified", data);
     } catch (err) {
       setError(err.message);
     }
@@ -499,6 +817,10 @@ export default function App() {
       setError("Потрібно погодитись з Privacy Policy та Terms of Service.");
       return;
     }
+    if (!isSignupPasswordCompliant) {
+      setError("Пароль не відповідає вимогам безпеки.");
+      return;
+    }
     try {
       const data = await api.register({
         first_name: firstName.trim(),
@@ -506,6 +828,14 @@ export default function App() {
         email,
         password
       });
+      if (data.email_verification_required) {
+        setAuthMode("signin");
+        setEmailVerificationChallengeToken(data.email_verification_challenge_token || "");
+        setEmailVerificationDevCode(data.email_verification_dev_code || "");
+        setEmailVerificationCode("");
+        setSuccess("Акаунт створено. Підтвердіть email кодом із листа.");
+        return;
+      }
       setToken(data.access_token);
       setSuccess("Акаунт створено.");
       setView("home");
@@ -526,9 +856,11 @@ export default function App() {
     setToken("");
     localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
     setProfile(null);
-      setBookings([]);
-      setMyReviews([]);
-      setFavorites([]);
+    setProfileDraft(null);
+    setBookings([]);
+    setMyReviews([]);
+    setFavorites([]);
+    setSelectedBooking(null);
     setAdminUsers([]);
     setRoles([]);
     setPolicies([]);
@@ -603,8 +935,143 @@ export default function App() {
     try {
       const detail = await api.getMyBooking(bookingId);
       setSelectedBooking(detail);
-      setReviewComment("");
+      if (detail.my_review) {
+        setReviewRating(detail.my_review.rating);
+        setReviewComment(detail.my_review.comment || "");
+      } else {
+        setReviewRating(5);
+        setReviewComment("");
+      }
       setModeratorMessage("");
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  function closeBookingDetail() {
+    setSelectedBooking(null);
+    setReviewComment("");
+    setReviewRating(5);
+    setModeratorMessage("");
+  }
+
+  function startEditProfile() {
+    setProfileDraft({
+      full_name: profile?.full_name || "",
+      phone: profile?.phone || ""
+    });
+  }
+
+  function cancelEditProfile() {
+    setProfileDraft(null);
+  }
+
+  async function saveProfileEdits(event) {
+    event.preventDefault();
+    if (!profileDraft) {
+      return;
+    }
+    setError("");
+    try {
+      const payload = {};
+      const draftName = profileDraft.full_name?.trim();
+      const draftPhone = profileDraft.phone?.trim();
+      if (draftName && draftName !== profile?.full_name) {
+        payload.full_name = draftName;
+      }
+      if (draftPhone !== (profile?.phone || "")) {
+        payload.phone = draftPhone || null;
+      }
+      const updated = Object.keys(payload).length > 0 ? await api.updateProfile(payload) : profile;
+      setProfile(updated);
+      setProfileDraft(null);
+      setSuccess("Профіль оновлено.");
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function toggleMfaPreference() {
+    if (!profile) {
+      return;
+    }
+    setError("");
+    setSuccess("");
+    try {
+      const updated = await api.updateMfaPreference({ enabled: !profile.mfa_enabled });
+      setProfile(updated);
+      setSuccess(updated.mfa_enabled ? "MFA увімкнено." : "MFA вимкнено.");
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function cancelMyBooking(bookingId) {
+    const confirmed = await askForConfirmation("Бронювання буде скасовано. Цю дію не можна скасувати.", {
+      title: "Скасувати бронювання?",
+      confirmLabel: "Скасувати бронь",
+      cancelLabel: "Не скасовувати",
+      tone: "danger"
+    });
+    if (!confirmed) {
+      return;
+    }
+    try {
+      await api.cancelBooking(bookingId, { reason: "User initiated cancellation" });
+      setSuccess("Бронювання скасовано.");
+      await loadCabinet();
+      if (selectedBooking?.id === bookingId) {
+        await loadBookingDetail(bookingId);
+      }
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function loadMyDataDeletionStatus() {
+    try {
+      const data = await api.getDataDeletionStatus();
+      setMyDataDeletionRequest(data);
+    } catch (err) {
+      setMyDataDeletionRequest(null);
+    }
+  }
+
+  async function requestDataDeletion() {
+    const confirmed = await askForConfirmation(
+      "Запит на видалення персональних даних буде надіслано адміністраторам. Згідно GDPR ми маємо 14 днів, щоб його обробити. Якщо ніхто не відреагує — акаунт автоматично видалиться.",
+      {
+        title: "Видалити дані?",
+        confirmLabel: "Надіслати запит",
+        cancelLabel: "Скасувати",
+        tone: "danger"
+      }
+    );
+    if (!confirmed) {
+      return;
+    }
+    try {
+      const result = await api.requestDataDeletion({});
+      setMyDataDeletionRequest(result);
+      setSuccess("Запит надіслано. Адміністратори мають 14 днів, щоб його обробити.");
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function withdrawDataDeletion() {
+    const confirmed = await askForConfirmation("Запит на видалення буде відкликано. Ви можете створити новий пізніше.", {
+      title: "Відкликати запит?",
+      confirmLabel: "Відкликати",
+      cancelLabel: "Залишити"
+    });
+    if (!confirmed) {
+      return;
+    }
+    try {
+      await api.cancelDataDeletionRequest();
+      setMyDataDeletionRequest(null);
+      setSuccess("Запит відкликано.");
     } catch (err) {
       setError(err.message);
     }
@@ -756,11 +1223,21 @@ export default function App() {
   async function loadAdmin() {
     setError("");
     try {
-      const [users, loadedRoles, loadedPolicies, allBookings] = await Promise.all([
-        api.listAdminUsers(),
-        api.listRoles(),
-        api.listPolicies(),
-        api.listBookings()
+      const isAdminRole = profile?.role === "admin" || profile?.role === "superuser";
+      const bookingsPromise = api.listDashboardBookings();
+      const usersPromise = isAdminRole ? api.listAdminUsers() : Promise.resolve([]);
+      const rolesPromise = isAdminRole ? api.listRoles() : Promise.resolve([]);
+      const policiesPromise = isAdminRole ? api.listPolicies() : Promise.resolve([]);
+      const deletionRequestsPromise = isAdminRole
+        ? api.listDataDeletionRequests(dataDeletionFilter).catch(() => [])
+        : Promise.resolve([]);
+
+      const [users, loadedRoles, loadedPolicies, allBookings, deletionRequests] = await Promise.all([
+        usersPromise,
+        rolesPromise,
+        policiesPromise,
+        bookingsPromise,
+        deletionRequestsPromise
       ]);
       setAdminUsers(users);
       if (users.length > 0) {
@@ -780,7 +1257,60 @@ export default function App() {
       setPolicies(loadedPolicies);
       setPermissionDrafts(buildPermissionDraftMap([...new Set([...defaultRoleNames, ...loadedRoles.map((role) => role.name)])], loadedPolicies));
       setAdminBookings(allBookings);
-      addLog("Loaded admin data", { users, loadedRoles, loadedPolicies });
+      setDataDeletionRequests(deletionRequests);
+      addLog("Loaded admin data", { users, loadedRoles, loadedPolicies, deletionRequests });
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function loadDataDeletionRequests(filter) {
+    try {
+      const data = await api.listDataDeletionRequests(filter ?? dataDeletionFilter);
+      setDataDeletionRequests(data);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function approveDataDeletion(requestId) {
+    const confirmed = await askForConfirmation(
+      "Акаунт користувача та персональні дані буде остаточно видалено.",
+      {
+        title: "Підтвердити видалення?",
+        confirmLabel: "Видалити зараз",
+        cancelLabel: "Скасувати",
+        tone: "danger"
+      }
+    );
+    if (!confirmed) {
+      return;
+    }
+    try {
+      await api.approveDataDeletionRequest(requestId, { note: "Approved by admin" });
+      setSuccess("Запит виконано, акаунт видалено.");
+      await loadAdmin();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function rejectDataDeletion(requestId) {
+    const confirmed = await askForConfirmation(
+      "Користувача буде сповіщено, що запит відхилено. Підстава має бути законною (GDPR Art. 17.3).",
+      {
+        title: "Відхилити запит?",
+        confirmLabel: "Відхилити",
+        cancelLabel: "Залишити"
+      }
+    );
+    if (!confirmed) {
+      return;
+    }
+    try {
+      await api.rejectDataDeletionRequest(requestId, { note: "Rejected by admin" });
+      setSuccess("Запит відхилено.");
+      await loadAdmin();
     } catch (err) {
       setError(err.message);
     }
@@ -788,6 +1318,17 @@ export default function App() {
 
   async function refreshAdminAndCourts() {
     await Promise.all([loadAdmin(), loadCourts()]);
+  }
+
+  async function remindBooking(bookingId) {
+    const comment = (bookingRemindComments[bookingId] || "").trim();
+    try {
+      await api.remindBooking(bookingId, { comment });
+      setSuccess("Нагадування надіслано.");
+      setBookingRemindComments((current) => ({ ...current, [bookingId]: "" }));
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
   async function createAdminUser(event) {
@@ -1563,13 +2104,24 @@ export default function App() {
         ) : null}
 
         {view === "cabinet" ? (
-          <section className="content-section">
-            {!isAuthed ? (
+          !isAuthed ? (
+            <section className="content-section">
               <section className="auth-screen">
                 <div className="auth-card">
                   <img src={logoUrl} alt="Courtly" className="auth-logo" />
                   <h2>{authMode === "signup" ? "Create an account" : "Sign in"}</h2>
-                  <form className="auth-form" onSubmit={authMode === "signup" ? handleRegister : handleLogin}>
+                  <form
+                    className="auth-form"
+                    onSubmit={
+                      authMode === "signup"
+                        ? handleRegister
+                        : emailVerificationChallengeToken
+                          ? handleVerifyEmail
+                          : mfaChallengeToken
+                            ? handleVerifyMfa
+                            : handleLogin
+                    }
+                  >
                     {authMode === "signup" ? (
                       <div className="auth-two-columns">
                         <label>
@@ -1582,14 +2134,66 @@ export default function App() {
                         </label>
                       </div>
                     ) : null}
-                    <label>
-                      <span>Email</span>
-                      <input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="example@email.com" type="email" required />
-                    </label>
-                    <label>
-                      <span>Password</span>
-                      <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" required />
-                    </label>
+                    {!emailVerificationChallengeToken && !mfaChallengeToken ? (
+                      <>
+                        <label>
+                          <span>Email</span>
+                          <input
+                            value={email}
+                            onChange={(event) => setEmail(event.target.value)}
+                            placeholder="example@email.com"
+                            type="email"
+                            required
+                          />
+                        </label>
+                        <label>
+                          <span>Password</span>
+                          <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" required />
+                        </label>
+                      </>
+                    ) : emailVerificationChallengeToken ? (
+                      <>
+                        <label>
+                          <span>6-digit email verification code</span>
+                          <input
+                            value={emailVerificationCode}
+                            onChange={(event) => setEmailVerificationCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                            inputMode="numeric"
+                            pattern="[0-9]{6}"
+                            placeholder="123456"
+                            required
+                          />
+                        </label>
+                      </>
+                    ) : (
+                      <>
+                        <label>
+                          <span>6-digit verification code</span>
+                          <input
+                            value={mfaCode}
+                            onChange={(event) => setMfaCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                            inputMode="numeric"
+                            pattern="[0-9]{6}"
+                            placeholder="123456"
+                            required
+                          />
+                        </label>
+                      </>
+                    )}
+                    {authMode === "signup" ? (
+                      <div className="password-strength-block" role="status" aria-live="polite">
+                        <div className={`password-strength-chip ${signupPasswordStrength}`}>
+                          Strength: {signupPasswordStrength}
+                        </div>
+                        <ul className="password-policy-list">
+                          <li className={signupPasswordPolicy.minLength ? "ok" : "fail"}>Minimum 8 symbols</li>
+                          <li className={signupPasswordPolicy.hasUpper ? "ok" : "fail"}>Uppercase letter (A-Z)</li>
+                          <li className={signupPasswordPolicy.hasLower ? "ok" : "fail"}>Lowercase letter (a-z)</li>
+                          <li className={signupPasswordPolicy.hasDigit ? "ok" : "fail"}>Number (0-9)</li>
+                          <li className={signupPasswordPolicy.hasSpecial ? "ok" : "fail"}>Special symbol (!@#...)</li>
+                        </ul>
+                      </div>
+                    ) : null}
                     {authMode === "signup" ? (
                       <>
                         <label>
@@ -1607,167 +2211,631 @@ export default function App() {
                       </>
                     ) : null}
                     <button className="primary-button full auth-submit" type="submit">
-                      {authMode === "signup" ? "Sign up" : "Sign in"}
+                      {authMode === "signup"
+                        ? "Sign up"
+                        : emailVerificationChallengeToken
+                          ? "Verify email"
+                          : mfaChallengeToken
+                            ? "Verify code"
+                            : "Sign in"}
                     </button>
+                    {authMode === "signin" && (mfaChallengeToken || emailVerificationChallengeToken) ? (
+                      <button
+                        className="secondary-button full"
+                        type="button"
+                        onClick={() => {
+                          setMfaChallengeToken("");
+                          setMfaCode("");
+                          setMfaDevCode("");
+                          setEmailVerificationChallengeToken("");
+                          setEmailVerificationCode("");
+                          setEmailVerificationDevCode("");
+                          setSuccess("");
+                        }}
+                      >
+                        Back to login
+                      </button>
+                    ) : null}
                   </form>
                   <button
                     className="auth-switch"
-                    onClick={() => setAuthMode(authMode === "signup" ? "signin" : "signup")}
+                    onClick={() => {
+                      setAuthMode(authMode === "signup" ? "signin" : "signup");
+                      setMfaChallengeToken("");
+                      setMfaCode("");
+                      setMfaDevCode("");
+                      setEmailVerificationChallengeToken("");
+                      setEmailVerificationCode("");
+                      setEmailVerificationDevCode("");
+                    }}
                     type="button"
                   >
                     {authMode === "signup" ? "Have an account? Sign in" : "No account? Sign up"}
                   </button>
                 </div>
               </section>
-            ) : (
-              <>
-                <div className="section-heading inline">
-                  <div>
-                    <h2>Профіль</h2>
+            </section>
+          ) : (
+            <section className="profile-page">
+              <header className="profile-hero">
+                <div className="profile-hero-main">
+                  <div className="profile-hero-identity">
+                    <div className="profile-avatar-xl">{getInitials(profile?.full_name)}</div>
+                    <div className="profile-hero-text">
+                      <span className="eyebrow dark">Мій профіль</span>
+                      <h1>{profile?.full_name || "Гість"}</h1>
+                      <div className="profile-hero-meta">
+                        <span className="role-chip">{profile?.role || "user"}</span>
+                        <span className="profile-hero-email">{profile?.email}</span>
+                        {profile?.phone ? <span className="profile-hero-phone">{profile.phone}</span> : null}
+                      </div>
+                    </div>
                   </div>
-                  <div className="row-actions">
-                    <button className="secondary-button" onClick={logout}>
+                  <div className="profile-hero-actions">
+                    {!isEditingProfile ? (
+                      <button className="primary-button compact" type="button" onClick={startEditProfile}>
+                        Редагувати профіль
+                      </button>
+                    ) : null}
+                    <button className="secondary-button compact" type="button" onClick={logout}>
                       Вийти
                     </button>
                   </div>
                 </div>
-
-                <div className="cabinet-grid">
-                  <article className="profile-card">
-                    <div className="avatar">{profile?.full_name?.slice(0, 1) || "C"}</div>
-                    <h3>{profile?.full_name}</h3>
-                    <p>{profile?.email}</p>
-                    <div className="profile-meta">
-                      <span>{profile?.role}</span>
-                      <span>{favorites.length} favorites</span>
-                    </div>
+                <div className="profile-stats">
+                  <article className="stat-card stat-primary">
+                    <span className="stat-label">Майбутні</span>
+                    <strong className="stat-value">{bookingGroups.upcoming.length}</strong>
+                    <small>Бронювання попереду</small>
                   </article>
-
-                  <article className="bookings-card">
-                    <div className="segmented-tabs">
-                      <button className={cabinetTab === "bookings" ? "active" : ""} onClick={() => setCabinetTab("bookings")}>
-                        My bookings
-                      </button>
-                      <button className={cabinetTab === "favorites" ? "active" : ""} onClick={() => setCabinetTab("favorites")}>
-                        Favorites
-                      </button>
-                      <button className={cabinetTab === "reviews" ? "active" : ""} onClick={() => setCabinetTab("reviews")}>
-                        Reviews
-                      </button>
-                    </div>
-                    <div className="booking-list">
-                      {cabinetTab === "bookings" ? (
-                        <>
-                          {bookings.length === 0 ? <div className="empty-state">Поки немає бронювань.</div> : null}
-                          {bookings.map((booking) => (
-                            <div className="booking-row" key={booking.id}>
-                              <div>
-                                <strong>{booking.court_name || activeCourt?.name || booking.court_id}</strong>
-                                <span>{new Date(booking.starts_at).toLocaleString()} - {booking.status}</span>
-                              </div>
-                              <strong>{formatMoney(booking.total_price || selectedTotal)}</strong>
-                              <button className="secondary-button compact" onClick={() => loadBookingDetail(booking.id)}>
-                                Деталі
-                              </button>
-                            </div>
-                          ))}
-                        </>
-                      ) : null}
-
-                      {cabinetTab === "favorites" ? (
-                        <>
-                          {favorites.length === 0 ? <div className="empty-state">Поки немає обраних кортів.</div> : null}
-                          {favorites.map((courtId) => {
-                            const court = courts.find((item) => item.id === courtId);
-                            return (
-                              <div className="booking-row" key={courtId}>
-                                <div>
-                                  <strong>{court?.name || courtId}</strong>
-                                  <span>{court ? `${court.address} - ${court.district}` : "Корт"}</span>
-                                </div>
-                                <strong>{court ? formatMoney(court.price_per_hour) : "-"}</strong>
-                                <button className="secondary-button compact" onClick={() => selectCourt(courtId)}>
-                                  Відкрити
-                                </button>
-                              </div>
-                            );
-                          })}
-                        </>
-                      ) : null}
-
-                      {cabinetTab === "reviews" ? (
-                        <>
-                          {myReviews.length === 0 ? <div className="empty-state">Поки немає відгуків.</div> : null}
-                          {myReviews.map((review) => (
-                            <div className="booking-row" key={review.id}>
-                              <div>
-                                <strong>{review.rating} ★</strong>
-                                <span>{review.comment}</span>
-                              </div>
-                              <strong>{new Date(review.created_at).toLocaleDateString()}</strong>
-                              <button className="secondary-button compact" onClick={() => selectCourt(review.court_id)}>
-                                Корт
-                              </button>
-                            </div>
-                          ))}
-                        </>
-                      ) : null}
-                    </div>
+                  <article className="stat-card">
+                    <span className="stat-label">Завершено</span>
+                    <strong className="stat-value">{bookingGroups.past.length}</strong>
+                    <small>Минулих бронювань</small>
+                  </article>
+                  <article className="stat-card">
+                    <span className="stat-label">Обране</span>
+                    <strong className="stat-value">{favorites.length}</strong>
+                    <small>Збережених кортів</small>
+                  </article>
+                  <article className="stat-card">
+                    <span className="stat-label">Відгуки</span>
+                    <strong className="stat-value">{myReviews.length}</strong>
+                    <small>Залишено</small>
+                  </article>
+                  <article className="stat-card stat-accent">
+                    <span className="stat-label">Витрачено</span>
+                    <strong className="stat-value">{formatMoney(totalSpent)}</strong>
+                    <small>За весь час</small>
                   </article>
                 </div>
+              </header>
 
-                {selectedBooking ? (
-                  <section className="booking-detail-panel">
-                    <div>
-                      <h3>{selectedBooking.court_name}</h3>
-                      <p>{selectedBooking.court_address}</p>
-                    </div>
-                    <div className="detail-facts">
-                      <span>{displayDate(selectedBooking.starts_at)}</span>
-                      <span>{displayTime(selectedBooking.starts_at)} - {displayTime(selectedBooking.ends_at)}</span>
-                      <span>{selectedBooking.status}</span>
-                      <span>{formatMoney(selectedBooking.total_price)}</span>
-                    </div>
-                    <div className="booking-actions-grid">
-                      <form className="inline-form-card" onSubmit={submitCourtReview}>
-                        <h4>Коментар про корт</h4>
-                        <select value={reviewRating} onChange={(event) => setReviewRating(event.target.value)}>
-                          {[5, 4, 3, 2, 1].map((rating) => (
-                            <option key={rating} value={rating}>{rating} ★</option>
+              <div className="profile-layout">
+                <aside className="profile-sidebar">
+                  <nav className="profile-section-nav" aria-label="Profile sections">
+                    {[
+                      ["bookings", "Бронювання", bookings.length],
+                      ["favorites", "Обране", favorites.length],
+                      ["reviews", "Відгуки", myReviews.length],
+                      ["settings", "Налаштування", null]
+                    ].map(([id, label, count]) => (
+                      <button
+                        key={id}
+                        type="button"
+                        className={cabinetTab === id ? "profile-section-link active" : "profile-section-link"}
+                        onClick={() => setCabinetTab(id)}
+                      >
+                        <span>{label}</span>
+                        {typeof count === "number" ? <em>{count}</em> : null}
+                      </button>
+                    ))}
+                  </nav>
+
+                  <article className="profile-edit-card">
+                    <header>
+                      <h3>Особисті дані</h3>
+                      {!isEditingProfile ? (
+                        <button className="link-button" type="button" onClick={startEditProfile}>
+                          Редагувати
+                        </button>
+                      ) : null}
+                    </header>
+                    {!isEditingProfile ? (
+                      <dl className="profile-fact-list">
+                        <div>
+                          <dt>Ім'я</dt>
+                          <dd>{profile?.full_name || "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>Email</dt>
+                          <dd>{profile?.email}</dd>
+                        </div>
+                        <div>
+                          <dt>Телефон</dt>
+                          <dd>{profile?.phone || "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>Роль</dt>
+                          <dd>{profile?.role}</dd>
+                        </div>
+                      </dl>
+                    ) : (
+                      <form className="profile-edit-form" onSubmit={saveProfileEdits}>
+                        <label>
+                          <span>Повне ім'я</span>
+                          <input
+                            value={profileDraft.full_name}
+                            onChange={(event) => setProfileDraft((current) => ({ ...current, full_name: event.target.value }))}
+                            placeholder="Ім'я Прізвище"
+                            required
+                          />
+                        </label>
+                        <label>
+                          <span>Телефон</span>
+                          <input
+                            value={profileDraft.phone}
+                            onChange={(event) => setProfileDraft((current) => ({ ...current, phone: event.target.value }))}
+                            placeholder="+380..."
+                            type="tel"
+                          />
+                        </label>
+                        <label className="profile-readonly-field">
+                          <span>Email</span>
+                          <input value={profile?.email || ""} disabled readOnly />
+                        </label>
+                        <div className="row-actions">
+                          <button className="primary-button compact" type="submit">
+                            Зберегти
+                          </button>
+                          <button className="secondary-button compact" type="button" onClick={cancelEditProfile}>
+                            Скасувати
+                          </button>
+                        </div>
+                      </form>
+                    )}
+                  </article>
+                </aside>
+
+                <main className="profile-content">
+                  {cabinetTab === "bookings" ? (
+                    <section className="profile-panel">
+                      <div className="profile-panel-head">
+                        <div>
+                          <span className="eyebrow dark">Бронювання</span>
+                          <h2>Мої бронювання</h2>
+                        </div>
+                        <div className="filter-row tight">
+                          {[
+                            ["upcoming", "Майбутні", bookingGroups.upcoming.length],
+                            ["past", "Минулі", bookingGroups.past.length],
+                            ["cancelled", "Скасовані", bookingGroups.cancelled.length],
+                            ["all", "Усі", bookings.length]
+                          ].map(([id, label, count]) => (
+                            <button
+                              key={id}
+                              type="button"
+                              className={bookingStatusFilter === id ? "chip active" : "chip"}
+                              onClick={() => setBookingStatusFilter(id)}
+                            >
+                              {label}
+                              <em className="chip-count">{count}</em>
+                            </button>
                           ))}
-                        </select>
+                        </div>
+                      </div>
+                      <div className="bookings-grid">
+                        {visibleBookings.length === 0 ? (
+                          <div className="empty-state large">
+                            <strong>Тут поки порожньо.</strong>
+                            <span>Знайди корт і заброньуй слот, щоб він з'явився тут.</span>
+                            <button className="primary-button compact" type="button" onClick={() => navigateTo("search")}>
+                              Знайти корт
+                            </button>
+                          </div>
+                        ) : null}
+                        {visibleBookings.map((booking) => {
+                          const info = bookingStatusInfo(booking);
+                          const canCancel = isBookingCancellable(booking);
+                          const courtImage = booking.court_image_url
+                            ? booking.court_image_url.startsWith("http")
+                              ? booking.court_image_url
+                              : `${API_ORIGIN}${booking.court_image_url}`
+                            : null;
+                          return (
+                            <article className={`booking-card ${info.tone}`} key={booking.id}>
+                              <div
+                                className="booking-card-image"
+                                style={
+                                  courtImage
+                                    ? { backgroundImage: `url(${courtImage})` }
+                                    : { background: courtVisuals[(booking.court_name || booking.court_id).length % courtVisuals.length] }
+                                }
+                              >
+                                <span className={`status-badge ${info.tone}`}>{info.label}</span>
+                              </div>
+                              <div className="booking-card-body">
+                                <div className="booking-card-head">
+                                  <h3>{booking.court_name || booking.court_id}</h3>
+                                  <p>{booking.court_address}{booking.court_district ? ` · ${booking.court_district}` : ""}</p>
+                                </div>
+                                <div className="booking-card-facts">
+                                  <div>
+                                    <span>Дата</span>
+                                    <strong>{displayLongDate(booking.starts_at)}</strong>
+                                  </div>
+                                  <div>
+                                    <span>Час</span>
+                                    <strong>{displayTime(booking.starts_at)} – {displayTime(booking.ends_at)}</strong>
+                                  </div>
+                                  <div>
+                                    <span>Тривалість</span>
+                                    <strong>{bookingDurationMinutes(booking.starts_at, booking.ends_at)} хв</strong>
+                                  </div>
+                                  <div>
+                                    <span>Сума</span>
+                                    <strong>{formatMoney(booking.total_price)}</strong>
+                                  </div>
+                                </div>
+                                <div className="booking-card-actions">
+                                  <button className="primary-button compact" type="button" onClick={() => loadBookingDetail(booking.id)}>
+                                    Деталі
+                                  </button>
+                                  <button className="secondary-button compact" type="button" onClick={() => selectCourt(booking.court_id)}>
+                                    До корту
+                                  </button>
+                                  {canCancel ? (
+                                    <button className="danger-button compact" type="button" onClick={() => cancelMyBooking(booking.id)}>
+                                      Скасувати
+                                    </button>
+                                  ) : null}
+                                  {booking.has_review ? <span className="muted-pill">Відгук залишено</span> : null}
+                                </div>
+                                {booking.status === "cancelled" && booking.canceled_reason ? (
+                                  <p className="cancel-reason">Причина: {booking.canceled_reason}</p>
+                                ) : null}
+                              </div>
+                            </article>
+                          );
+                        })}
+                      </div>
+                    </section>
+                  ) : null}
+
+                  {cabinetTab === "favorites" ? (
+                    <section className="profile-panel">
+                      <div className="profile-panel-head">
+                        <div>
+                          <span className="eyebrow dark">Обране</span>
+                          <h2>Збережені корти</h2>
+                        </div>
+                      </div>
+                      <div className="favorites-grid">
+                        {favorites.length === 0 ? (
+                          <div className="empty-state large">
+                            <strong>Ще немає обраного.</strong>
+                            <span>Додавай корти у обране кнопкою «Зберегти» на картці корту.</span>
+                            <button className="primary-button compact" type="button" onClick={() => navigateTo("search")}>
+                              Обрати корт
+                            </button>
+                          </div>
+                        ) : null}
+                        {favorites.map((courtId) => {
+                          const court = courts.find((item) => item.id === courtId);
+                          const image = court?.image_url
+                            ? court.image_url.startsWith("http")
+                              ? court.image_url
+                              : `${API_ORIGIN}${court.image_url}`
+                            : null;
+                          return (
+                            <article className="favorite-card" key={courtId}>
+                              <div
+                                className="favorite-card-image"
+                                style={image ? { backgroundImage: `url(${image})` } : { background: court?.image || courtVisuals[0] }}
+                              />
+                              <div className="favorite-card-body">
+                                <h3>{court?.name || "Невідомий корт"}</h3>
+                                <p>{court ? `${court.address} · ${court.district}` : "Корт"}</p>
+                                <div className="meta-grid">
+                                  {court?.surface ? <span>{court.surface}</span> : null}
+                                  {court?.rating ? <span>{court.rating} ★</span> : null}
+                                  {court ? <span>{formatMoney(court.price_per_hour)} / h</span> : null}
+                                </div>
+                                <div className="row-actions">
+                                  <button className="primary-button compact" type="button" onClick={() => selectCourt(courtId)}>
+                                    Відкрити корт
+                                  </button>
+                                  <button className="secondary-button compact" type="button" onClick={() => toggleFavorite(courtId)}>
+                                    Прибрати
+                                  </button>
+                                </div>
+                              </div>
+                            </article>
+                          );
+                        })}
+                      </div>
+                    </section>
+                  ) : null}
+
+                  {cabinetTab === "reviews" ? (
+                    <section className="profile-panel">
+                      <div className="profile-panel-head">
+                        <div>
+                          <span className="eyebrow dark">Відгуки</span>
+                          <h2>Мої відгуки</h2>
+                        </div>
+                      </div>
+                      <div className="my-reviews-grid">
+                        {myReviews.length === 0 ? (
+                          <div className="empty-state large">
+                            <strong>Поки немає відгуків.</strong>
+                            <span>Залиш свій відгук після гри в деталях бронювання.</span>
+                          </div>
+                        ) : null}
+                        {myReviews.map((review) => {
+                          const court = courts.find((item) => item.id === review.court_id);
+                          return (
+                            <article className="my-review-card" key={review.id}>
+                              <div className="my-review-rating" aria-label={`Rating ${review.rating} out of 5`}>
+                                <strong>{review.rating}</strong>
+                                <span>★</span>
+                              </div>
+                              <div className="my-review-body">
+                                <h3>{court?.name || review.court_id}</h3>
+                                <p>{review.comment}</p>
+                                <span className="muted-pill">{displayLongDate(review.created_at)}</span>
+                              </div>
+                              <button className="secondary-button compact" type="button" onClick={() => selectCourt(review.court_id)}>
+                                До корту
+                              </button>
+                            </article>
+                          );
+                        })}
+                      </div>
+                    </section>
+                  ) : null}
+
+                  {cabinetTab === "settings" ? (
+                    <section className="profile-panel">
+                      <div className="profile-panel-head">
+                        <div>
+                          <span className="eyebrow dark">Налаштування</span>
+                          <h2>Акаунт</h2>
+                        </div>
+                      </div>
+                      <div className="settings-grid">
+                        <article className="settings-card">
+                          <h3>Дані профілю</h3>
+                          <p>Зміни ім'я, телефон чи перевір контактний email у блоці зліва.</p>
+                          {!isEditingProfile ? (
+                            <button className="primary-button compact" type="button" onClick={startEditProfile}>
+                              Редагувати дані
+                            </button>
+                          ) : (
+                            <span className="muted-pill">Зараз редагується</span>
+                          )}
+                        </article>
+                        <article className="settings-card">
+                          <h3>Вийти з акаунту</h3>
+                          <p>Завершити поточну сесію у браузері. Дані залишаться на сервері.</p>
+                          <button className="secondary-button compact" type="button" onClick={logout}>
+                            Вийти
+                          </button>
+                        </article>
+                        <article className="settings-card">
+                          <h3>Двофакторна автентифікація (MFA)</h3>
+                          <p>
+                            Статус: <strong>{profile?.mfa_enabled ? "увімкнено" : "вимкнено"}</strong>. Для admin та superuser MFA
+                            завжди обов'язкова.
+                          </p>
+                          <button className="primary-button compact" type="button" onClick={toggleMfaPreference}>
+                            {profile?.mfa_enabled ? "Вимкнути MFA" : "Увімкнути MFA"}
+                          </button>
+                        </article>
+                        <article className={`settings-card danger-card gdpr-card ${myDataDeletionRequest ? "is-pending" : ""}`}>
+                          <h3>Видалити персональні дані</h3>
+                          {myDataDeletionRequest ? (
+                            <>
+                              <p>
+                                Запит активний. Згідно GDPR Art. 17, адміністратори мають 14 днів, щоб його обробити. Якщо
+                                ніхто не відреагує — акаунт буде автоматично видалено.
+                              </p>
+                              <div className="gdpr-status-block">
+                                {(() => {
+                                  const secs = secondsUntil(myDataDeletionRequest.deadline_at, nowTick);
+                                  return (
+                                    <span className={`status-badge ${deletionUrgencyTone(secs)}`}>
+                                      {secs > 0 ? `Залишилось ${formatCountdown(secs)}` : "Час вийшов"}
+                                    </span>
+                                  );
+                                })()}
+                                <dl className="gdpr-status-meta">
+                                  <div>
+                                    <dt>Подано</dt>
+                                    <dd>{displayLongDate(myDataDeletionRequest.requested_at)}</dd>
+                                  </div>
+                                  <div>
+                                    <dt>Дедлайн</dt>
+                                    <dd>{displayLongDate(myDataDeletionRequest.deadline_at)}</dd>
+                                  </div>
+                                </dl>
+                              </div>
+                              <button className="secondary-button compact" type="button" onClick={withdrawDataDeletion}>
+                                Відкликати запит
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              <p>Запит надсилається адміністраторам. Згідно GDPR обробка триває до 14 днів — після цього акаунт автоматично видалиться.</p>
+                              <button className="danger-button compact" type="button" onClick={requestDataDeletion}>
+                                Надіслати запит
+                              </button>
+                            </>
+                          )}
+                        </article>
+                      </div>
+                    </section>
+                  ) : null}
+                </main>
+              </div>
+
+              {selectedBooking ? (
+                <div className="booking-drawer-backdrop" onClick={closeBookingDetail}>
+                  <aside
+                    className="booking-drawer"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="booking-drawer-title"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <header className="booking-drawer-header">
+                      <div>
+                        <span className="eyebrow dark">Бронювання</span>
+                        <h2 id="booking-drawer-title">{selectedBooking.court_name || selectedBooking.court_id}</h2>
+                        <p>
+                          {selectedBooking.court_address}
+                          {selectedBooking.court_city ? ` · ${selectedBooking.court_city}` : ""}
+                          {selectedBooking.court_district ? `, ${selectedBooking.court_district}` : ""}
+                        </p>
+                      </div>
+                      <button className="icon-close" type="button" aria-label="Закрити" onClick={closeBookingDetail}>
+                        ×
+                      </button>
+                    </header>
+
+                    <div
+                      className="booking-drawer-image"
+                      style={
+                        selectedBooking.court_image_url
+                          ? {
+                              backgroundImage: `url(${
+                                selectedBooking.court_image_url.startsWith("http")
+                                  ? selectedBooking.court_image_url
+                                  : `${API_ORIGIN}${selectedBooking.court_image_url}`
+                              })`
+                            }
+                          : { background: courtVisuals[0] }
+                      }
+                    >
+                      <span className={`status-badge ${bookingStatusInfo(selectedBooking).tone}`}>
+                        {bookingStatusInfo(selectedBooking).label}
+                      </span>
+                    </div>
+
+                    <div className="booking-drawer-facts">
+                      <div>
+                        <span>Дата</span>
+                        <strong>{displayLongDate(selectedBooking.starts_at)}</strong>
+                      </div>
+                      <div>
+                        <span>Час</span>
+                        <strong>{displayTime(selectedBooking.starts_at)} – {displayTime(selectedBooking.ends_at)}</strong>
+                      </div>
+                      <div>
+                        <span>Тривалість</span>
+                        <strong>{bookingDurationMinutes(selectedBooking.starts_at, selectedBooking.ends_at)} хв</strong>
+                      </div>
+                      <div>
+                        <span>Покриття</span>
+                        <strong>{selectedBooking.court_surface || "—"}</strong>
+                      </div>
+                      <div>
+                        <span>Сума</span>
+                        <strong>{formatMoney(selectedBooking.total_price)}</strong>
+                      </div>
+                      {selectedBooking.created_at ? (
+                        <div>
+                          <span>Створено</span>
+                          <strong>{displayLongDate(selectedBooking.created_at)}</strong>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    {selectedBooking.status === "cancelled" && selectedBooking.canceled_reason ? (
+                      <p className="cancel-reason large">Причина скасування: {selectedBooking.canceled_reason}</p>
+                    ) : null}
+
+                    <div className="booking-drawer-actions">
+                      <button className="secondary-button compact" type="button" onClick={() => selectCourt(selectedBooking.court_id)}>
+                        Перейти до корту
+                      </button>
+                      {isBookingCancellable(selectedBooking) ? (
+                        <button
+                          className="danger-button compact"
+                          type="button"
+                          onClick={() => cancelMyBooking(selectedBooking.id)}
+                        >
+                          Скасувати бронь
+                        </button>
+                      ) : null}
+                    </div>
+
+                    <div className="booking-drawer-section">
+                      <h3>{selectedBooking.my_review ? "Твій відгук" : "Залиш відгук про корт"}</h3>
+                      <form className="inline-form-card" onSubmit={submitCourtReview}>
+                        <div className="rating-row">
+                          {[1, 2, 3, 4, 5].map((star) => (
+                            <button
+                              key={star}
+                              type="button"
+                              className={`star-button ${Number(reviewRating) >= star ? "active" : ""}`}
+                              onClick={() => setReviewRating(star)}
+                              aria-label={`${star} stars`}
+                            >
+                              ★
+                            </button>
+                          ))}
+                          <span className="rating-value">{reviewRating} / 5</span>
+                        </div>
                         <textarea
                           value={reviewComment}
                           onChange={(event) => setReviewComment(event.target.value)}
                           placeholder="Що сподобалось або що треба покращити?"
                           required
                         />
-                        <button className="primary-button" type="submit">Опублікувати</button>
+                        <button className="primary-button compact" type="submit">
+                          {selectedBooking.my_review ? "Оновити" : "Опублікувати"}
+                        </button>
                       </form>
+                    </div>
+
+                    <div className="booking-drawer-section">
+                      <h3>Написати модератору</h3>
                       <form className="inline-form-card" onSubmit={sendModeratorMessage}>
-                        <h4>Написати модератору</h4>
                         <textarea
                           value={moderatorMessage}
                           onChange={(event) => setModeratorMessage(event.target.value)}
                           placeholder="Питання щодо бронювання, корту або доступу..."
                           required
                         />
-                        <button className="secondary-button" type="submit">Відправити</button>
+                        <button className="secondary-button compact" type="submit">
+                          Відправити
+                        </button>
                       </form>
                     </div>
-                    <div className="review-list-mini">
-                      {(selectedBooking.reviews || []).map((review) => (
-                        <div key={review.id}>
-                          <strong>{review.rating} ★</strong>
-                          <span>{review.comment}</span>
+
+                    {selectedBooking.reviews && selectedBooking.reviews.length > 0 ? (
+                      <div className="booking-drawer-section">
+                        <h3>Останні відгуки про корт</h3>
+                        <div className="drawer-review-list">
+                          {selectedBooking.reviews.map((review) => (
+                            <article key={review.id} className={`drawer-review ${review.is_mine ? "is-mine" : ""}`}>
+                              <header>
+                                <strong>{review.rating} ★</strong>
+                                <span>{displayLongDate(review.created_at)}</span>
+                                {review.is_mine ? <span className="mine-pill">твій</span> : null}
+                              </header>
+                              <p>{review.comment}</p>
+                            </article>
+                          ))}
                         </div>
-                      ))}
-                    </div>
-                  </section>
-                ) : null}
-              </>
-            )}
-          </section>
+                      </div>
+                    ) : null}
+                  </aside>
+                </div>
+              ) : null}
+            </section>
+          )
         ) : null}
 
         {view === "admin" && isManager ? (
@@ -1812,11 +2880,18 @@ export default function App() {
 
             <div className="admin-tabs">
               {[
-                ["users", "Users"],
-                ["roles", "Roles"],
-                ["permissions", "Permissions"],
-                ["courts", "Courts"],
-                ["bookings", "Bookings"]
+                ...(profile?.role === "admin" || profile?.role === "superuser"
+                  ? [
+                      ["users", "Users"],
+                      ["roles", "Roles"],
+                      ["permissions", "Permissions"],
+                      ["courts", "Courts"]
+                    ]
+                  : []),
+                ["bookings", "Bookings"],
+                ...(profile?.role === "admin" || profile?.role === "superuser"
+                  ? [["gdpr", `GDPR${dataDeletionRequests.filter((row) => row.status === "pending").length > 0 ? ` · ${dataDeletionRequests.filter((row) => row.status === "pending").length}` : ""}`]]
+                  : [])
               ].map(([id, label]) => (
                 <button key={id} className={adminTab === id ? "active" : ""} onClick={() => setAdminTab(id)}>
                   {label}
@@ -1824,7 +2899,7 @@ export default function App() {
               ))}
             </div>
 
-            {adminTab === "users" ? (
+            {adminTab === "users" && (profile?.role === "admin" || profile?.role === "superuser") ? (
               <div className="admin-panel-grid courts-admin-layout">
                 <form className="admin-form-card" onSubmit={createAdminUser}>
                   <h3>Create user</h3>
@@ -1864,19 +2939,15 @@ export default function App() {
                           type="button"
                           onClick={() => openUserEditor(user)}
                         >
-                          <strong>{user.full_name}</strong>
-                          <span>#{user.id} - {user.role} - {user.is_active ? "active" : "inactive"}</span>
+                          <strong>Користувач #{user.id}</strong>
+                          <span>{user.role} - {user.is_active ? "active" : "inactive"}</span>
                         </button>
                       ))}
                     </div>
                     {adminUserForm ? (
                       <form className="court-editor-panel" onSubmit={saveUserEditor}>
                         <h4>Edit user</h4>
-                        <input
-                          value={adminUserForm.full_name || ""}
-                          onChange={(event) => setAdminUserForm((current) => ({ ...current, full_name: event.target.value }))}
-                          placeholder="Full name"
-                        />
+                        <input value={"Hidden by privacy policy"} disabled readOnly />
                         <select
                           value={adminUserForm.role || "user"}
                           onChange={(event) => setAdminUserForm((current) => ({ ...current, role: event.target.value }))}
@@ -1897,9 +2968,15 @@ export default function App() {
                         </label>
                         <div className="row-actions">
                           <button className="primary-button" type="submit">Save changes</button>
-                          <button className="danger-button" type="button" onClick={() => deleteAdminUser(adminUserForm.id)}>
-                            Delete user
-                          </button>
+                          {adminUserForm.role !== "superuser" && adminUserForm.id !== profile?.id ? (
+                            <button className="danger-button" type="button" onClick={() => deleteAdminUser(adminUserForm.id)}>
+                              Delete user
+                            </button>
+                          ) : (
+                            <span className="muted-pill">
+                              {adminUserForm.id === profile?.id ? "Власний акаунт" : "Системний акаунт"}
+                            </span>
+                          )}
                         </div>
                       </form>
                     ) : null}
@@ -1908,7 +2985,7 @@ export default function App() {
               </div>
             ) : null}
 
-            {adminTab === "roles" ? (
+            {adminTab === "roles" && (profile?.role === "admin" || profile?.role === "superuser") ? (
               <div className="admin-panel-grid">
                 <form className="admin-form-card" onSubmit={createRole}>
                   <h3>Create role</h3>
@@ -1931,7 +3008,7 @@ export default function App() {
               </div>
             ) : null}
 
-            {adminTab === "permissions" ? (
+            {adminTab === "permissions" && (profile?.role === "admin" || profile?.role === "superuser") ? (
               <div className="permissions-layout">
                 {endpointPermissionCatalog.map((entry) => (
                   <article className="permissions-role-card" key={entry.endpoint}>
@@ -2013,7 +3090,7 @@ export default function App() {
               </div>
             ) : null}
 
-            {adminTab === "courts" ? (
+            {adminTab === "courts" && (profile?.role === "admin" || profile?.role === "superuser") ? (
               <div className="admin-panel-grid courts-admin-layout">
                 <form className="admin-form-card" onSubmit={createCourt}>
                   <h3>Create court</h3>
@@ -2124,17 +3201,151 @@ export default function App() {
                     <span>User</span>
                     <span>Court</span>
                     <span>Status</span>
+                    <span>Date & time</span>
+                    <span>До старту</span>
                     <span>Total</span>
+                    <span>Reminder</span>
                   </div>
                   {adminBookings.map((booking) => (
                     <div className="admin-row" key={booking.id}>
                       <span>{booking.id.slice(0, 8)}</span>
-                      <span>{booking.user_id}</span>
-                      <span>{booking.court_id.slice(0, 8)}</span>
+                      <span>Hidden</span>
+                      <span>{booking.court_name || booking.court_id.slice(0, 8)}</span>
                       <strong>{booking.status}</strong>
+                      <span>{formatBookingRange(booking.starts_at, booking.ends_at)}</span>
+                      <span>
+                        {secondsUntil(booking.starts_at, nowTick) > 0
+                          ? formatCountdown(secondsUntil(booking.starts_at, nowTick))
+                          : "Вже почалось/минуло"}
+                      </span>
                       <span>{formatMoney(booking.total_price)}</span>
+                      <div className="row-actions">
+                        <input
+                          value={bookingRemindComments[booking.id] || ""}
+                          onChange={(event) =>
+                            setBookingRemindComments((current) => ({ ...current, [booking.id]: event.target.value }))
+                          }
+                          placeholder="Коментар (опційно)"
+                        />
+                        <button className="secondary-button compact" type="button" onClick={() => remindBooking(booking.id)}>
+                          Remind
+                        </button>
+                      </div>
                     </div>
                   ))}
+                </div>
+              </div>
+            ) : null}
+
+            {adminTab === "gdpr" && (profile?.role === "admin" || profile?.role === "superuser") ? (
+              <div className="gdpr-panel">
+                <div className="gdpr-panel-head">
+                  <div>
+                    <h3>GDPR — запити на видалення</h3>
+                    <p>
+                      Згідно Art. 17 GDPR ми маємо <strong>14 днів</strong>, щоб обробити запит. Якщо не апрувнути або не відхилити — система видалить акаунт автоматично.
+                    </p>
+                  </div>
+                  <div className="filter-row tight">
+                    {[
+                      ["pending", "Активні"],
+                      ["approved_executed", "Виконані"],
+                      ["cancelled", "Відхилені"],
+                      ["expired_executed", "Прострочені"],
+                      ["all", "Усі"]
+                    ].map(([id, label]) => (
+                      <button
+                        key={id}
+                        type="button"
+                        className={dataDeletionFilter === id ? "chip active" : "chip"}
+                        onClick={() => setDataDeletionFilter(id)}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="gdpr-grid">
+                  {dataDeletionRequests.length === 0 ? (
+                    <div className="empty-state large">
+                      <strong>Запитів немає.</strong>
+                      <span>Коли користувач подасть запит — він з'явиться тут із відліком.</span>
+                    </div>
+                  ) : null}
+                  {dataDeletionRequests.map((row) => {
+                    const secs = secondsUntil(row.deadline_at, nowTick);
+                    const isPending = row.status === "pending";
+                    const tone = isPending ? deletionUrgencyTone(secs) : row.status === "approved_executed" || row.status === "expired_executed" ? "danger" : "muted";
+                    return (
+                      <article className={`gdpr-card-admin ${tone}`} key={row.id}>
+                        <header>
+                          <div>
+                            <strong>Запит #{row.id}</strong>
+                            <span>Користувач прихований</span>
+                          </div>
+                          <span className={`status-badge ${tone}`}>
+                            {isPending
+                              ? secs > 0
+                                ? formatCountdown(secs)
+                                : "Час вийшов"
+                              : row.status === "approved_executed"
+                                ? "Видалено вручну"
+                                : row.status === "expired_executed"
+                                  ? "Авто-видалено"
+                                  : "Відхилено"}
+                          </span>
+                        </header>
+                        {isPending ? (
+                          <div className="gdpr-progress" aria-hidden="true">
+                            <div
+                              className={`gdpr-progress-bar ${tone}`}
+                              style={{
+                                width: `${Math.min(100, Math.max(0, ((row.deadline_days_total * 86400 - secs) / (row.deadline_days_total * 86400)) * 100))}%`
+                              }}
+                            />
+                          </div>
+                        ) : null}
+                        <dl className="gdpr-card-facts">
+                          <div>
+                            <dt>Подано</dt>
+                            <dd>{displayLongDate(row.requested_at)}</dd>
+                          </div>
+                          <div>
+                            <dt>Дедлайн</dt>
+                            <dd>{displayLongDate(row.deadline_at)}</dd>
+                          </div>
+                          {row.processed_at ? (
+                            <div>
+                              <dt>Оброблено</dt>
+                              <dd>{displayLongDate(row.processed_at)}</dd>
+                            </div>
+                          ) : null}
+                          {row.reason ? (
+                            <div className="full-row">
+                              <dt>Причина</dt>
+                              <dd>{row.reason}</dd>
+                            </div>
+                          ) : null}
+                          {row.processed_note ? (
+                            <div className="full-row">
+                              <dt>Нотатка адміна</dt>
+                              <dd>{row.processed_note}</dd>
+                            </div>
+                          ) : null}
+                        </dl>
+                        {isPending ? (
+                          <div className="row-actions">
+                            <button className="danger-button compact" type="button" onClick={() => approveDataDeletion(row.id)}>
+                              Видалити зараз
+                            </button>
+                            <button className="secondary-button compact" type="button" onClick={() => rejectDataDeletion(row.id)}>
+                              Відхилити
+                            </button>
+                          </div>
+                        ) : null}
+                      </article>
+                    );
+                  })}
                 </div>
               </div>
             ) : null}
@@ -2150,6 +3361,20 @@ export default function App() {
           </section>
         ) : null}
       </main>
+      {error ? (
+        <div className="toast error-toast" role="alert">
+          <span>⚠</span>
+          <span>{error}</span>
+          <button type="button" aria-label="Закрити" onClick={() => setError("")}>×</button>
+        </div>
+      ) : null}
+      {success ? (
+        <div className="toast success-toast" role="status">
+          <span>✓</span>
+          <span>{success}</span>
+          <button type="button" aria-label="Закрити" onClick={() => setSuccess("")}>×</button>
+        </div>
+      ) : null}
       {confirmDialog ? (
         <div className="confirm-backdrop" onClick={() => closeConfirmDialog(false)}>
           <div className="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" onClick={(event) => event.stopPropagation()}>
