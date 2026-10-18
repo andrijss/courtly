@@ -1828,7 +1828,6 @@ export default function App() {
             <div className="results-column">
               <div className="section-heading inline">
                 <div>
-                  <span className="eyebrow dark">Courts</span>
                   <h2>Обери корт</h2>
                 </div>
               </div>
@@ -1914,7 +1913,6 @@ export default function App() {
             <aside className="map-panel">
               <div className="map-top">
                 <div>
-                  <span className="eyebrow dark">Мапа</span>
                   <h3>Карта кортів</h3>
                 </div>
               </div>
@@ -1939,7 +1937,6 @@ export default function App() {
                 }
               >
                 <div className="detail-title-card">
-                  <span className="eyebrow dark">Корт</span>
                   <h1>{activeCourt.name}</h1>
                   <p>{activeCourt.address} - {activeCourt.city}, {activeCourt.district}</p>
                   <div className="meta-grid compact-meta">
@@ -1954,7 +1951,6 @@ export default function App() {
               <section className="slot-section calendar-fullbleed">
                 <div className="section-heading inline">
                   <div>
-                    <span className="eyebrow dark">Календар</span>
                     <h2>Тижневий календар</h2>
                   </div>
                   <div className="calendar-controls">
@@ -2020,7 +2016,6 @@ export default function App() {
               <section className="reviews-section">
                 <div className="section-heading inline">
                   <div>
-                    <span className="eyebrow dark">Відгуки</span>
                     <h2>Що кажуть гравці</h2>
                   </div>
                 </div>
@@ -2038,7 +2033,6 @@ export default function App() {
             </div>
 
             <aside className="booking-summary">
-              <span className="eyebrow dark">Бронювання</span>
               <h2>{activeCourt.name}</h2>
               <div className="summary-list">
                 <div>
@@ -2262,7 +2256,6 @@ export default function App() {
                   <div className="profile-hero-identity">
                     <div className="profile-avatar-xl">{getInitials(profile?.full_name)}</div>
                     <div className="profile-hero-text">
-                      <span className="eyebrow dark">Мій профіль</span>
                       <h1>{profile?.full_name || "Гість"}</h1>
                       <div className="profile-hero-meta">
                         <span className="role-chip">{profile?.role || "user"}</span>
@@ -2402,7 +2395,6 @@ export default function App() {
                     <section className="profile-panel">
                       <div className="profile-panel-head">
                         <div>
-                          <span className="eyebrow dark">Бронювання</span>
                           <h2>Мої бронювання</h2>
                         </div>
                         <div className="filter-row tight">
@@ -2506,7 +2498,6 @@ export default function App() {
                     <section className="profile-panel">
                       <div className="profile-panel-head">
                         <div>
-                          <span className="eyebrow dark">Обране</span>
                           <h2>Збережені корти</h2>
                         </div>
                       </div>
@@ -2561,7 +2552,6 @@ export default function App() {
                     <section className="profile-panel">
                       <div className="profile-panel-head">
                         <div>
-                          <span className="eyebrow dark">Відгуки</span>
                           <h2>Мої відгуки</h2>
                         </div>
                       </div>
@@ -2599,7 +2589,6 @@ export default function App() {
                     <section className="profile-panel">
                       <div className="profile-panel-head">
                         <div>
-                          <span className="eyebrow dark">Налаштування</span>
                           <h2>Акаунт</h2>
                         </div>
                       </div>
@@ -2690,7 +2679,6 @@ export default function App() {
                   >
                     <header className="booking-drawer-header">
                       <div>
-                        <span className="eyebrow dark">Бронювання</span>
                         <h2 id="booking-drawer-title">{selectedBooking.court_name || selectedBooking.court_id}</h2>
                         <p>
                           {selectedBooking.court_address}
@@ -2842,7 +2830,6 @@ export default function App() {
           <section className="content-section admin-section">
             <div className="section-heading inline">
               <div>
-                <span className="eyebrow dark">Дашборд</span>
                 <h2>Admin control center</h2>
               </div>
               <button className="primary-button" onClick={refreshAdminAndCourts} disabled={!isAuthed}>

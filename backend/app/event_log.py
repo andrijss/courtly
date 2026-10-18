@@ -6,6 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.config import get_settings
+from app.crypto import PIIEncryptor
 
 
 class EventLogger:
@@ -15,6 +16,23 @@ class EventLogger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self.path.write_text("", encoding="utf-8")
+        self._pii = PIIEncryptor()
+
+    def _mask_payload(self, value: Any, key: str | None = None) -> Any:
+        pii_keys = {
+            "email",
+            "full_name",
+            "user_email",
+            "user_full_name",
+            "target_email",
+        }
+        if isinstance(value, dict):
+            return {k: self._mask_payload(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._mask_payload(item, key) for item in value]
+        if key in pii_keys and isinstance(value, str) and value:
+            return self._pii.encrypt(value)
+        return value
 
     def _last_hash(self) -> str:
         lines = self.path.read_text(encoding="utf-8").splitlines()
@@ -23,17 +41,23 @@ class EventLogger:
         last_event = json.loads(lines[-1])
         return last_event["hash"]
 
-    def append(self, event_type: str, actor_id: int | None, payload: dict[str, Any]) -> dict[str, Any]:
+    def append(
+        self, event_type: str, actor_id: int | None, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        safe_payload = self._mask_payload(payload)
         event = {
             "event_id": str(uuid4()),
             "event_type": event_type,
             "actor_id": actor_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "payload": payload,
+            "payload": safe_payload,
             "prev_hash": self._last_hash(),
         }
         digest = hashlib.sha256(
-            (event["prev_hash"] + json.dumps(event, separators=(",", ":"), sort_keys=True)).encode("utf-8")
+            (
+                event["prev_hash"]
+                + json.dumps(event, separators=(",", ":"), sort_keys=True)
+            ).encode("utf-8")
         ).hexdigest()
         event["hash"] = digest
 
@@ -52,11 +76,17 @@ class EventLogger:
                 if event["prev_hash"] != prev_hash:
                     return False, count
                 expected = hashlib.sha256(
-                    (event["prev_hash"] + json.dumps({k: v for k, v in event.items() if k != "hash"}, separators=(",", ":"), sort_keys=True)).encode("utf-8")
+                    (
+                        event["prev_hash"]
+                        + json.dumps(
+                            {k: v for k, v in event.items() if k != "hash"},
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                    ).encode("utf-8")
                 ).hexdigest()
                 if event["hash"] != expected:
                     return False, count
                 prev_hash = event["hash"]
                 count += 1
         return True, count
-

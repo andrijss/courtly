@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.crypto import email_lookup_hash
 from app.authz import enforce_policy
 from app.database import get_db
 from app.deps import get_current_user
@@ -42,7 +43,11 @@ def transfer_ownership(
             status_code=status.HTTP_404_NOT_FOUND, detail="Court not found"
         )
     enforce_policy(db, user, "/courts/:courtId", "update", owner_id=court.owner_id)
-    new_owner = db.scalar(select(User).where(User.email == payload.new_owner_email))
+    new_owner = db.scalar(
+        select(User).where(
+            User.email_hash == email_lookup_hash(payload.new_owner_email)
+        )
+    )
     # Anti-enumeration behavior: generic success even if account does not exist.
     if new_owner:
         court.owner_id = new_owner.id

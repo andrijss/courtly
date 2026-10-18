@@ -26,6 +26,8 @@ class Settings(BaseSettings):
 
     superuser_email: str = "superuser@courtly.example.com"
     superuser_password: str = "ChangeMeNow123!"
+    seed_user_email: str = "user_a@example.com"
+    seed_user_password: str = "Qwerty1#"
     resend_api_key: str = ""
     mfa_from_email: str = "security@courtly.click"
     mfa_code_minutes: int = 5
