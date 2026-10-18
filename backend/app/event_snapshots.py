@@ -3,7 +3,18 @@
 from datetime import datetime, timezone
 from typing import Any
 
-from app.models import Booking, Court, Favorite, Permission, Policy, Review, Role, RoleBinding, RolePermission, User
+from app.models import (
+    Booking,
+    Court,
+    Favorite,
+    Permission,
+    Policy,
+    Review,
+    Role,
+    RoleBinding,
+    RolePermission,
+    User,
+)
 
 
 def _dt(value: datetime | None) -> str | None:
@@ -17,8 +28,9 @@ def _dt(value: datetime | None) -> str | None:
 def user_dict(user: User) -> dict[str, Any]:
     return {
         "id": user.id,
-        "email": user.email,
-        "full_name": user.full_name,
+        "email_encrypted": user._email_encrypted,
+        "full_name_encrypted": user._full_name_encrypted,
+        "email_hash": user.email_hash,
         "password_hash": user.password_hash,
         "role": user.role,
         "phone_encrypted": user.phone_encrypted,

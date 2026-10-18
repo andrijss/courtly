@@ -7,6 +7,7 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.crypto import PIIEncryptor, email_lookup_hash
 from app.database import Base, SessionLocal, engine
 from app.gdpr import sweep_expired
 from app.models import Court, Permission, Policy, Role, User
@@ -14,6 +15,7 @@ from app.routers import api_router
 from app.security import hash_password
 
 settings = get_settings()
+encryptor = PIIEncryptor()
 app = FastAPI(title=settings.app_name)
 uploads_dir = Path(__file__).resolve().parent.parent / "uploads"
 uploads_dir.mkdir(parents=True, exist_ok=True)
@@ -40,6 +42,12 @@ def _ensure_schema() -> None:
         user_columns = {
             row[1] for row in connection.execute(text("PRAGMA table_info(users)"))
         }
+        if "email_hash" not in user_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE users ADD COLUMN email_hash VARCHAR(64) DEFAULT '' NOT NULL"
+                )
+            )
         if "mfa_enabled" not in user_columns:
             connection.execute(
                 text(
@@ -245,8 +253,19 @@ def _seed_rbac_policies(db: Session) -> None:
 def _seed_defaults() -> None:
     db: Session = SessionLocal()
     try:
+        for existing in db.scalars(select(User)).all():
+            if not existing.email_hash:
+                existing.email_hash = email_lookup_hash(existing.email)
+            if ":" not in existing._email_encrypted:
+                existing._email_encrypted = encryptor.encrypt(existing._email_encrypted)
+            if ":" not in existing._full_name_encrypted:
+                existing._full_name_encrypted = encryptor.encrypt(
+                    existing._full_name_encrypted
+                )
         superuser = db.scalar(
-            select(User).where(User.email == settings.superuser_email)
+            select(User).where(
+                User.email_hash == email_lookup_hash(settings.superuser_email)
+            )
         )
         if superuser is None:
             superuser = User(
@@ -262,6 +281,22 @@ def _seed_defaults() -> None:
             db.flush()
         elif not superuser.email_verified:
             superuser.email_verified = True
+        seed_user = db.scalar(
+            select(User).where(
+                User.email_hash == email_lookup_hash(settings.seed_user_email)
+            )
+        )
+        if seed_user is None:
+            seed_user = User(
+                email=settings.seed_user_email,
+                full_name="User A",
+                password_hash=hash_password(settings.seed_user_password),
+                role="user",
+                email_verified=True,
+            )
+            db.add(seed_user)
+        elif not seed_user.email_verified:
+            seed_user.email_verified = True
         _seed_rbac_policies(db)
         sample_courts = [
             {

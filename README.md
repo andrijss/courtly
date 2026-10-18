@@ -31,6 +31,13 @@ Default seeded superuser:
 - email: `superuser@courtly.example.com`
 - password: `ChangeMeNow123!`
 
+Default seeded user:
+
+- email: `user_a@example.com`
+- password: `Qwerty1#`
+
+The backend creates this active, email-verified `user` account on startup when it is missing from the database. Override its credentials with `COURTLY_SEED_USER_EMAIL` and `COURTLY_SEED_USER_PASSWORD`.
+
 ## Frontend Run
 
 ```bash

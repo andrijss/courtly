@@ -52,7 +52,6 @@ export default function LandingCourtScene() {
         />
       </Canvas>
       <div className="hero-gradient-ring" />
-      <div className="scene-hint">Drag to rotate</div>
     </div>
   );
 }

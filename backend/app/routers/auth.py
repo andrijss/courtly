@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.crypto import email_lookup_hash
 from app.database import get_db
 from app.deps import get_current_user
 from app.event_log import EventLogger
@@ -106,7 +107,9 @@ def _send_email_verification_code(email: str, code: str) -> None:
     )
 
 
-def _issue_email_verification_challenge(user: User) -> LoginResponse:
+def _issue_email_verification_challenge(
+    user: User, recipient_email: str
+) -> LoginResponse:
     code = str(secrets.randbelow(900000) + 100000)
     code_hash = _mfa_code_hash(user.id, code)
     challenge = create_token(
@@ -116,7 +119,7 @@ def _issue_email_verification_challenge(user: User) -> LoginResponse:
         extra={"uid": user.id, "code_hash": code_hash},
     )
     try:
-        _send_email_verification_code(user.email, code)
+        _send_email_verification_code(recipient_email, code)
     except Exception as exc:
         if isinstance(exc, HTTPException):
             raise
@@ -141,13 +144,32 @@ def _issue_email_verification_challenge(user: User) -> LoginResponse:
 
 @router.post("/login", response_model=LoginResponse)
 def login(payload: LoginRequest, db: Session = Depends(get_db)) -> LoginResponse:
-    user = db.scalar(select(User).where(User.email == payload.email))
+    user = db.scalar(
+        select(User).where(User.email_hash == email_lookup_hash(payload.email))
+    )
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
         )
+    normalized_email = payload.email.strip().lower()
+    repaired = False
+    if user.email != normalized_email:
+        user.email = normalized_email
+        repaired = True
+    if not user.full_name:
+        fallback_name = (
+            normalized_email.split("@", maxsplit=1)[0]
+            .replace(".", " ")
+            .replace("_", " ")
+            .strip()
+        )
+        user.full_name = fallback_name.title() or "User"
+        repaired = True
+    if repaired:
+        db.commit()
+        db.refresh(user)
     if not user.email_verified:
-        return _issue_email_verification_challenge(user)
+        return _issue_email_verification_challenge(user, payload.email)
     if user.role in {"admin", "superuser"} or user.mfa_enabled:
         code = str(secrets.randbelow(900000) + 100000)
         code_hash = _mfa_code_hash(user.id, code)
@@ -158,7 +180,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> LoginResponse
             extra={"uid": user.id, "code_hash": code_hash},
         )
         try:
-            _send_mfa_code(user.email, code)
+            _send_mfa_code(payload.email, code)
         except Exception as exc:
             if isinstance(exc, HTTPException):
                 raise
@@ -256,7 +278,9 @@ def verify_email(
     "/register", response_model=LoginResponse, status_code=status.HTTP_201_CREATED
 )
 def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> LoginResponse:
-    if db.scalar(select(User).where(User.email == payload.email)):
+    if db.scalar(
+        select(User).where(User.email_hash == email_lookup_hash(payload.email))
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="Email already exists"
         )
@@ -273,7 +297,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> LoginRe
     event_logger.append(
         "auth.register", user.id, {"email": user.email, "user": user_dict(user)}
     )
-    return _issue_email_verification_challenge(user)
+    return _issue_email_verification_challenge(user, payload.email)
 
 
 @router.post("/refresh", response_model=TokenPair)
@@ -300,7 +324,9 @@ def refresh(payload: RefreshRequest, db: Session = Depends(get_db)) -> TokenPair
 def forgot_password(
     payload: ForgotPasswordRequest, db: Session = Depends(get_db)
 ) -> Message:
-    user = db.scalar(select(User).where(User.email == payload.email))
+    user = db.scalar(
+        select(User).where(User.email_hash == email_lookup_hash(payload.email))
+    )
     event_logger.append(
         "auth.forgot_password", user.id if user else None, {"email": payload.email}
     )

@@ -12,6 +12,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.crypto import PIIEncryptor, email_lookup_hash
 from app.database import Base
 
 
@@ -23,8 +24,13 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
-    full_name: Mapped[str] = mapped_column(String(200))
+    _email_encrypted: Mapped[str] = mapped_column(
+        "email", String(600), unique=True, index=True
+    )
+    email_hash: Mapped[str] = mapped_column(
+        String(64), unique=True, index=True, default=""
+    )
+    _full_name_encrypted: Mapped[str] = mapped_column("full_name", String(600))
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(50), default="user", index=True)
     phone_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -35,6 +41,26 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
+
+    _pii = PIIEncryptor()
+
+    @property
+    def email(self) -> str:
+        return self._pii.decrypt(self._email_encrypted) or ""
+
+    @email.setter
+    def email(self, value: str) -> None:
+        clean = value.strip().lower()
+        self._email_encrypted = self._pii.encrypt(clean)
+        self.email_hash = email_lookup_hash(clean)
+
+    @property
+    def full_name(self) -> str:
+        return self._pii.decrypt(self._full_name_encrypted) or ""
+
+    @full_name.setter
+    def full_name(self, value: str) -> None:
+        self._full_name_encrypted = self._pii.encrypt(value.strip())
 
 
 class Court(Base):

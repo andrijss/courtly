@@ -50,8 +50,15 @@ def _upsert_user(db: Session, row: dict[str, Any]) -> None:
     if obj is None:
         obj = User(id=uid)
         db.add(obj)
-    obj.email = row["email"]
-    obj.full_name = row["full_name"]
+    if "email_encrypted" in row:
+        obj._email_encrypted = row["email_encrypted"]
+        obj.email_hash = row.get("email_hash", "")
+    else:
+        obj.email = row["email"]
+    if "full_name_encrypted" in row:
+        obj._full_name_encrypted = row["full_name_encrypted"]
+    else:
+        obj.full_name = row["full_name"]
     obj.password_hash = row["password_hash"]
     obj.role = row["role"]
     obj.phone_encrypted = row.get("phone_encrypted")
@@ -316,7 +323,10 @@ def _replay_rbac_permission_bound(db: Session, p: dict[str, Any]) -> None:
         if role_id is None or perm_id is None:
             return
         existing = db.scalar(
-            select(RolePermission).where(RolePermission.role_id == role_id, RolePermission.permission_id == perm_id)
+            select(RolePermission).where(
+                RolePermission.role_id == role_id,
+                RolePermission.permission_id == perm_id,
+            )
         )
         if existing:
             return
@@ -329,7 +339,11 @@ def _replay_rbac_permission_unbound(db: Session, p: dict[str, Any]) -> None:
     role_id, perm_id = p.get("role_id"), p.get("permission_id")
     if role_id is None or perm_id is None:
         return
-    link = db.scalar(select(RolePermission).where(RolePermission.role_id == role_id, RolePermission.permission_id == perm_id))
+    link = db.scalar(
+        select(RolePermission).where(
+            RolePermission.role_id == role_id, RolePermission.permission_id == perm_id
+        )
+    )
     if link:
         db.delete(link)
 
@@ -432,7 +446,11 @@ def _replay_favorite_removed(db: Session, p: dict[str, Any]) -> None:
     user_id, court_id = p.get("user_id"), p.get("court_id")
     if user_id is None or court_id is None:
         return
-    fav = db.scalar(select(Favorite).where(Favorite.user_id == user_id, Favorite.court_id == court_id))
+    fav = db.scalar(
+        select(Favorite).where(
+            Favorite.user_id == user_id, Favorite.court_id == court_id
+        )
+    )
     if fav:
         db.delete(fav)
 
@@ -506,16 +524,32 @@ MUTATION_HANDLERS: dict[str, ReplayFn] = {
 def _resync_sqlite_sequences(db: Session) -> None:
     if not str(engine.url).startswith("sqlite"):
         return
-    has_seq = db.scalar(text("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"))
+    has_seq = db.scalar(
+        text(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+        )
+    )
     if not has_seq:
         return
-    for model in (User, Role, Permission, Policy, Favorite, Review, RoleBinding, RolePermission):
+    for model in (
+        User,
+        Role,
+        Permission,
+        Policy,
+        Favorite,
+        Review,
+        RoleBinding,
+        RolePermission,
+    ):
         table = model.__tablename__
         mid = db.scalar(select(func.max(model.id)))
         if mid is None:
             continue
         db.execute(text("DELETE FROM sqlite_sequence WHERE name = :t"), {"t": table})
-        db.execute(text("INSERT INTO sqlite_sequence (name, seq) VALUES (:t, :s)"), {"t": table, "s": mid})
+        db.execute(
+            text("INSERT INTO sqlite_sequence (name, seq) VALUES (:t, :s)"),
+            {"t": table, "s": mid},
+        )
 
 
 def replay_events(path: Path, db: Session) -> int:

@@ -91,8 +91,9 @@ export function onUnauthorized(handler) {
 
 async function request(path, options = {}) {
   const skipAuthHeader = options.headers && Object.prototype.hasOwnProperty.call(options.headers, "Authorization");
+  const tokenForRequest = accessToken;
 
-  if (accessToken && !skipAuthHeader && isTokenExpired(accessToken)) {
+  if (tokenForRequest && !skipAuthHeader && isTokenExpired(tokenForRequest)) {
     triggerUnauthorized("expired");
     throw new Error("Сесія завершилась. Увійди заново.");
   }
@@ -102,8 +103,8 @@ async function request(path, options = {}) {
     ...(isFormData ? {} : { "Content-Type": "application/json" }),
     ...(options.headers || {})
   };
-  if (accessToken && !skipAuthHeader) {
-    headers.Authorization = `Bearer ${accessToken}`;
+  if (tokenForRequest && !skipAuthHeader) {
+    headers.Authorization = `Bearer ${tokenForRequest}`;
   }
 
   const response = await fetch(`${API_BASE}${path}`, {
@@ -112,7 +113,9 @@ async function request(path, options = {}) {
   });
 
   if (response.status === 401 && !skipAuthHeader) {
-    triggerUnauthorized("rejected");
+    if (!tokenForRequest || tokenForRequest === accessToken) {
+      triggerUnauthorized("rejected");
+    }
     const body = await response.text();
     throw new Error(body || "Сесія завершилась. Увійди заново.");
   }
